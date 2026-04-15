@@ -10,6 +10,7 @@ license = "MIT"
 readme = "README.md"
 keywords = ["genetics", "bioinformatics", "variants", "annotation", "genomics"]
 categories = ["science", "api-bindings"]
+repository = "https://github.com/koesterlab/genebears"
 
 [dependencies]
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "query"] }
