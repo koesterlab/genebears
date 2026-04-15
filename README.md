@@ -73,8 +73,6 @@ let opts = AnnotateOptions {
 };
 ```
 
----
-
 ## Large variant lists
 
 `annotate_variants_chunked` splits automatically at 1 000 and respects the
