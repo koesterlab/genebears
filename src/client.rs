@@ -84,13 +84,6 @@ impl GeneBears {
         let mut default_headers = HeaderMap::new();
         default_headers.insert(header::ACCEPT, HeaderValue::from_static("application/json"));
 
-        if let (Some(email), Some(key)) = (&config.email, &config.api_key) {
-            let encoded = base64_encode(&format!("{email}:{key}"));
-            let value = HeaderValue::from_str(&format!("Basic {encoded}"))
-                .map_err(|e| GeneBearError::Other(e.to_string()))?;
-            default_headers.insert(header::AUTHORIZATION, value);
-        }
-
         let http = Client::builder().default_headers(default_headers).build()?;
 
         let cache = if let Some(ref path) = config.cache_path {
@@ -287,36 +280,6 @@ impl GeneBears {
         }
         Ok(())
     }
-}
-
-/// Minimal Base64 encoder — avoids pulling in a heavyweight dependency just
-/// for the Authorization header.
-fn base64_encode(input: &str) -> String {
-    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-
-    let bytes = input.as_bytes();
-    let mut out = String::with_capacity((bytes.len() + 2) / 3 * 4);
-
-    for chunk in bytes.chunks(3) {
-        let b0 = chunk[0] as u32;
-        let b1 = chunk.get(1).copied().unwrap_or(0) as u32;
-        let b2 = chunk.get(2).copied().unwrap_or(0) as u32;
-        let n = (b0 << 16) | (b1 << 8) | b2;
-
-        out.push(TABLE[((n >> 18) & 0x3f) as usize] as char);
-        out.push(TABLE[((n >> 12) & 0x3f) as usize] as char);
-        if chunk.len() > 1 {
-            out.push(TABLE[((n >> 6) & 0x3f) as usize] as char);
-        } else {
-            out.push('=');
-        }
-        if chunk.len() > 2 {
-            out.push(TABLE[(n & 0x3f) as usize] as char);
-        } else {
-            out.push('=');
-        }
-    }
-    out
 }
 
 #[cfg(test)]
