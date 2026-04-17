@@ -98,7 +98,7 @@ pub(crate) struct ApiResponse {
 ///
 /// Every field is `Option<T>` — the API may omit fields depending on variant
 /// type, `omit_*` flags, or absence of data.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct AnnotatedVariant {
     pub chr: Option<String>,
     pub pos: Option<u64>,

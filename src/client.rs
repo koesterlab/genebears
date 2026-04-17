@@ -304,4 +304,41 @@ mod tests {
             assert!(result.pos.is_some());
         }
     }
+
+    #[tokio::test]
+    async fn cache_hit_skips_http() {
+        use tempfile::tempdir;
+        use wiremock::matchers::any;
+        use wiremock::{Mock, MockServer};
+
+        let server = MockServer::start().await;
+        Mock::given(any())
+            .respond_with(wiremock::ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("cache.duckdb");
+        let variant = Variant::new("22", 12345, "A", "T");
+        let cache = Cache::open(&db_path).unwrap();
+        let key = variant.cache_key(Genome::Hg38);
+
+        let ann = AnnotatedVariant::default();
+
+        cache.store(&key, &ann).unwrap();
+
+        let config = ClientConfig {
+            cache_path: Some(db_path.clone()),
+            base_url: Some(server.uri()),
+            ..Default::default()
+        };
+
+        let client = GeneBears::new(config).unwrap();
+        let _res = client
+            .annotate_variant(&variant, Genome::Hg38, AnnotateOptions::default())
+            .await
+            .unwrap();
+        server.verify().await;
+    }
 }
