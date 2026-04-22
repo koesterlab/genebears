@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.0](https://github.com/koesterlab/genebears/compare/v0.1.0...v0.2.0) (2026-04-22)
+
+
+### Features
+
+* derive ValueEnum for Genome ([#5](https://github.com/koesterlab/genebears/issues/5)) ([fcdc790](https://github.com/koesterlab/genebears/commit/fcdc790f6462e25ca86c257df834c43da8249a92))
+
 ## 0.1.0 (2026-04-15)
 
 
