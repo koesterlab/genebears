@@ -1,7 +1,8 @@
+use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
 
 /// Reference genome assembly.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default, ValueEnum)]
 #[serde(rename_all = "lowercase")]
 pub enum Genome {
     #[default]

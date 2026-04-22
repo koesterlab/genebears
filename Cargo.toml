@@ -20,6 +20,7 @@ tokio = { version = "1", features = ["full"] }
 thiserror = "2"
 duckdb = { version = "1.10500", features = ["bundled"] }
 tracing = "0.1"
+clap = { version = "4", features = ["derive"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "macros"] }
