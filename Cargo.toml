@@ -13,7 +13,7 @@ categories = ["science", "api-bindings"]
 repository = "https://github.com/koesterlab/genebears"
 
 [dependencies]
-reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "query"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "native-tls", "query"] }
 serde       = { version = "1", features = ["derive"] }
 serde_json  = "1"
 tokio = { version = "1", features = ["full"] }
