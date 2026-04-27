@@ -220,9 +220,16 @@ impl GeneBears {
         let status = resp.status();
         if !status.is_success() {
             let msg = resp.text().await.unwrap_or_default();
-            return Err(GeneBearError::Api {
-                status: status.as_u16(),
-                message: msg,
+            return Err(if status.is_client_error() {
+                GeneBearError::ApiClientError {
+                    status: status.as_u16(),
+                    message: msg,
+                }
+            } else {
+                GeneBearError::ApiServerError {
+                    status: status.as_u16(),
+                    message: msg,
+                }
             });
         }
 

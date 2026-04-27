@@ -11,9 +11,12 @@ pub enum GeneBearError {
     /// DuckDB cache errors.
     #[error("Cache error: {0}")]
     Cache(#[from] duckdb::Error),
-    /// The GeneBe API returned a non-2xx status code.
-    #[error("API error (HTTP {status}): {message}")]
-    Api { status: u16, message: String },
+    /// The GeneBe API rejected the request (4xx) — likely bad input.
+    #[error("API client error (HTTP {status}): {message}")]
+    ApiClientError { status: u16, message: String },
+    /// The GeneBe API failed to process the request (5xx) — e.g. unknown contig.
+    #[error("API server error (HTTP {status}): {message}")]
+    ApiServerError { status: u16, message: String },
     /// Requested batch exceeds the API limit of 1 000 variants.
     #[error("Batch too large: {requested} variants requested, maximum is 1 000")]
     BatchTooLarge { requested: usize },
