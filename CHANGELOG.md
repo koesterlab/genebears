@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.2](https://github.com/koesterlab/genebears/compare/v0.2.1...v0.2.2) (2026-04-27)
+
+
+### Bug Fixes
+
+* Distinguish API client and server errors ([#9](https://github.com/koesterlab/genebears/issues/9)) ([83edfce](https://github.com/koesterlab/genebears/commit/83edfced5fe51cd8c98ddeb280536f2c56303385))
+
 ## [0.2.1](https://github.com/koesterlab/genebears/compare/v0.2.0...v0.2.1) (2026-04-23)
 
 
