@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.0](https://github.com/koesterlab/genebears/compare/v0.2.2...v0.3.0) (2026-09-28)
+
+
+### Features
+
+* Keep variant order and expose GeneBe warnings ([#11](https://github.com/koesterlab/genebears/issues/11)) ([791ecbe](https://github.com/koesterlab/genebears/commit/791ecbefbf7588fa586755550c13c027b2ab17b6))
+
 ## [0.2.2](https://github.com/koesterlab/genebears/compare/v0.2.1...v0.2.2) (2026-04-27)
 
 
