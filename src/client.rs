@@ -128,6 +128,8 @@ impl GeneBears {
     }
 
     /// Annotate a **batch** of variants (up to 1 000).
+    ///
+    /// Results are returned in the same order as `variants`.
     pub async fn annotate_variants(
         &self,
         variants: &[Variant],
@@ -235,11 +237,16 @@ impl GeneBears {
 
         let api_response: ApiResponse = resp.json().await?;
         let fetched = api_response.variants;
+        if fetched.len() != miss_indices.len() {
+            return Err(GeneBearError::Other(format!(
+                "GeneBe returned {} annotations for {} variants",
+                fetched.len(),
+                miss_indices.len()
+            )));
+        }
 
-        for (local_idx, &original_idx) in miss_indices.iter().enumerate() {
-            if let Some(ann) = fetched.get(local_idx) {
-                results[original_idx] = Some(ann.clone());
-            }
+        for (&original_idx, ann) in miss_indices.iter().zip(fetched) {
+            results[original_idx] = Some(ann);
         }
 
         if let Some(cache) = &self.cache {
@@ -347,5 +354,47 @@ mod tests {
             .await
             .unwrap();
         server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn missing_annotations_are_an_error() {
+        use wiremock::matchers::any;
+        use wiremock::{Mock, MockServer};
+
+        let server = MockServer::start().await;
+        Mock::given(any())
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "variants": [{}] })),
+            )
+            .mount(&server)
+            .await;
+
+        let config = ClientConfig {
+            base_url: Some(server.uri()),
+            ..Default::default()
+        };
+        let client = GeneBears::new(config).unwrap();
+        let variants = vec![
+            Variant::new("22", 100, "A", "T"),
+            Variant::new("22", 200, "C", "G"),
+        ];
+
+        let result = client
+            .annotate_variants(&variants, Genome::Hg38, AnnotateOptions::default())
+            .await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn reference_mismatch_is_reported_as_warning() {
+        let client = GeneBears::new(ClientConfig::default()).unwrap();
+        let variant = Variant::new("7", 140_753_336, "G", "T");
+
+        let result = client
+            .annotate_variant(&variant, Genome::Hg38, AnnotateOptions::default())
+            .await
+            .unwrap();
+        assert!(result.warning.is_some());
     }
 }

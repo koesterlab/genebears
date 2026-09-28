@@ -106,6 +106,7 @@ pub struct AnnotatedVariant {
     #[serde(rename = "ref")]
     pub ref_allele: Option<String>,
     pub alt: Option<String>,
+    pub warning: Option<String>,
     pub effect: Option<String>,
     pub transcript: Option<String>,
     pub gene_symbol: Option<String>,

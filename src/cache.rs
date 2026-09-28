@@ -148,6 +148,7 @@ mod tests {
             pos: Some(1_000),
             ref_allele: Some("A".into()),
             alt: Some("T".into()),
+            warning: None,
             gene_symbol: Some(gene.into()),
             revel_score: Some(score),
             effect: None,
