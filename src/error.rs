@@ -8,8 +8,8 @@ pub enum GeneBearError {
     /// JSON serialization / deserialization errors.
     #[error("JSON error: {0}")]
     Json(#[from] serde_json::Error),
-    /// DuckDB cache errors.
-    #[error("Cache error: {0}")]
+    /// DuckDB errors of the cache or of Hub database lookups.
+    #[error("DuckDB error: {0}")]
     Cache(#[from] duckdb::Error),
     /// The GeneBe API rejected the request (4xx) — likely bad input.
     #[error("API client error (HTTP {status}): {message}")]
@@ -20,6 +20,16 @@ pub enum GeneBearError {
     /// Requested batch exceeds the API limit of 1 000 variants.
     #[error("Batch too large: {requested} variants requested, maximum is 1 000")]
     BatchTooLarge { requested: usize },
+    /// I/O errors, e.g. of the local GeneBe Hub store.
+    #[error("I/O error: {0}")]
+    Io(#[from] std::io::Error),
+    /// A file downloaded from the GeneBe Hub does not match its size or checksum.
+    #[error("Downloaded file {file} does not match its size or checksum")]
+    Checksum { file: String },
+    /// The GeneBe Hub database requires accepting its license, which genebears does not
+    /// support.
+    #[error("{id} requires accepting its license, which is not supported")]
+    LicenseNotAccepted { id: String },
     /// Catch-all for miscellaneous errors.
     #[error("{0}")]
     Other(String),

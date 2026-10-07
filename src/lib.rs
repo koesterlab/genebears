@@ -1,7 +1,8 @@
 //! # genebears
 //!
 //! A lightweight Rust client for the [GeneBe](https://genebe.net/) genetic
-//! variant annotation API.
+//! variant annotation API, and for annotating variants locally with databases
+//! from the [GeneBe Hub](https://genebe.net/hub) (see [`Hub`] and [`Store`]).
 //!
 //! ## Quick start
 //!
@@ -34,9 +35,13 @@
 pub mod cache;
 pub mod client;
 pub mod error;
+pub mod hub;
 pub mod models;
 pub mod rate_limiter;
+pub mod store;
 
 pub use client::{ClientConfig, GeneBears};
 pub use error::GeneBearError;
+pub use hub::{Database, DatabaseId, Hub};
 pub use models::{AnnotateOptions, AnnotatedVariant, Genome, Variant};
+pub use store::{Installed, Store};

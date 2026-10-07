@@ -1,11 +1,12 @@
 use std::path::PathBuf;
 
 use reqwest::header::{self, HeaderMap, HeaderValue};
-use reqwest::Client;
+use reqwest::{Client, Response};
 use tracing::{debug, info, warn};
 
 use crate::cache::Cache;
 use crate::error::GeneBearError;
+use crate::hub::Hub;
 use crate::models::{AnnotateOptions, AnnotatedVariant, ApiResponse, Genome, Variant};
 use crate::rate_limiter::RateLimiter;
 
@@ -217,23 +218,7 @@ impl GeneBears {
             req = req.basic_auth(email, Some(key));
         }
 
-        let resp = req.query(&query).json(&body).send().await?;
-
-        let status = resp.status();
-        if !status.is_success() {
-            let msg = resp.text().await.unwrap_or_default();
-            return Err(if status.is_client_error() {
-                GeneBearError::ApiClientError {
-                    status: status.as_u16(),
-                    message: msg,
-                }
-            } else {
-                GeneBearError::ApiServerError {
-                    status: status.as_u16(),
-                    message: msg,
-                }
-            });
-        }
+        let resp = check(req.query(&query).json(&body).send().await?).await?;
 
         let api_response: ApiResponse = resp.json().await?;
         let fetched = api_response.variants;
@@ -294,6 +279,36 @@ impl GeneBears {
         }
         Ok(())
     }
+
+    /// Access the GeneBe Hub with the credentials and base URL of this client.
+    pub fn hub(&self) -> Hub {
+        Hub {
+            http: self.http.clone(),
+            base_url: self.base_url.clone(),
+            credentials: self.email.clone().zip(self.api_key.clone()),
+        }
+    }
+}
+
+/// Turn error responses into [`GeneBearError::ApiClientError`] or
+/// [`GeneBearError::ApiServerError`].
+pub(crate) async fn check(response: Response) -> Result<Response, GeneBearError> {
+    let status = response.status();
+    if status.is_success() {
+        return Ok(response);
+    }
+    let message = response.text().await.unwrap_or_default();
+    Err(if status.is_client_error() {
+        GeneBearError::ApiClientError {
+            status: status.as_u16(),
+            message,
+        }
+    } else {
+        GeneBearError::ApiServerError {
+            status: status.as_u16(),
+            message,
+        }
+    })
 }
 
 #[cfg(test)]

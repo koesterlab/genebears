@@ -64,6 +64,94 @@ impl Variant {
             genome.as_str()
         )
     }
+
+    /// Convert into the key of GeneBe Hub databases: chromosome without `chr`, 0-based
+    /// position, number of deleted bases and inserted bases. Shared bases are trimmed from
+    /// the end (keeping one base per allele), the start and the end again, which gives the
+    /// keys GeneBe builds from normalized VCF records. Returns `None` for indels that are not
+    /// provably left-aligned, non-ACGT alleles and chromosomes other than 1-22, X, Y and M.
+    pub(crate) fn to_spdi(&self) -> Option<Spdi> {
+        let seq = ["chr", "CHR", "Chr"]
+            .iter()
+            .find_map(|prefix| self.chr.strip_prefix(prefix))
+            .unwrap_or(&self.chr);
+        let seq = if seq == "MT" { "M" } else { seq };
+        if !CHROMOSOMES.contains(&seq) {
+            return None;
+        }
+
+        let reference = self.ref_allele.to_ascii_uppercase();
+        let alternative = self.alt_allele.to_ascii_uppercase();
+        if !is_dna(&reference) || !is_dna(&alternative) {
+            return None;
+        }
+        let (mut deleted, mut inserted) = (reference.as_str(), alternative.as_str());
+        while deleted.len() > 1
+            && inserted.len() > 1
+            && deleted.as_bytes().last() == inserted.as_bytes().last()
+        {
+            deleted = &deleted[..deleted.len() - 1];
+            inserted = &inserted[..inserted.len() - 1];
+        }
+        let leading = deleted
+            .bytes()
+            .zip(inserted.bytes())
+            .take_while(|(r, a)| r == a)
+            .count();
+        let (deleted, inserted) = (&deleted[leading..], &inserted[leading..]);
+        let trailing = deleted
+            .bytes()
+            .rev()
+            .zip(inserted.bytes().rev())
+            .take_while(|(r, a)| r == a)
+            .count();
+        let deleted = &deleted[..deleted.len() - trailing];
+        let inserted = &inserted[..inserted.len() - trailing];
+        if deleted.is_empty() && inserted.is_empty() {
+            return None;
+        }
+
+        if deleted.is_empty() || inserted.is_empty() {
+            // A pure indel is left-aligned if the base before it differs from its last base.
+            let indel = if deleted.is_empty() {
+                inserted
+            } else {
+                deleted
+            };
+            let before = reference[..leading].bytes().last()?;
+            if indel.bytes().last() == Some(before) {
+                return None;
+            }
+        }
+
+        Some(Spdi {
+            seq: seq.to_string(),
+            pos: u32::try_from(self.pos.checked_sub(1)? + leading as u64).ok()?,
+            del: deleted.len() as u32,
+            ins: inserted.to_string(),
+        })
+    }
+}
+
+const CHROMOSOMES: [&str; 25] = [
+    "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15", "16", "17",
+    "18", "19", "20", "21", "22", "X", "Y", "M",
+];
+
+fn is_dna(allele: &str) -> bool {
+    !allele.is_empty()
+        && allele
+            .bytes()
+            .all(|base| matches!(base, b'A' | b'C' | b'G' | b'T'))
+}
+
+/// A variant in the notation of GeneBe Hub databases.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct Spdi {
+    pub seq: String,
+    pub pos: u32,
+    pub del: u32,
+    pub ins: String,
 }
 
 /// Controls which sections of the annotation the API should compute.
@@ -271,6 +359,126 @@ mod tests {
 
         let decoded: Variant = serde_json::from_str(&json).unwrap();
         assert_eq!(v, decoded);
+    }
+
+    fn spdi(seq: &str, pos: u32, del: u32, ins: &str) -> Option<Spdi> {
+        Some(Spdi {
+            seq: seq.to_string(),
+            pos,
+            del,
+            ins: ins.to_string(),
+        })
+    }
+
+    #[test]
+    fn to_spdi_matches_genebe_examples() {
+        // Examples from the GeneBe Hub format description.
+        assert_eq!(
+            Variant::new("chr1", 1000, "AG", "TT").to_spdi(),
+            spdi("1", 999, 2, "TT")
+        );
+        assert_eq!(
+            Variant::new("1", 12, "A", "C").to_spdi(),
+            spdi("1", 11, 1, "C")
+        );
+    }
+
+    #[test]
+    fn to_spdi_removes_shared_bases_of_indels() {
+        assert_eq!(
+            Variant::new("2", 200, "ATG", "A").to_spdi(),
+            spdi("2", 200, 2, "")
+        );
+        assert_eq!(
+            Variant::new("3", 300, "C", "CTAG").to_spdi(),
+            spdi("3", 300, 0, "TAG")
+        );
+    }
+
+    #[test]
+    fn to_spdi_removes_shared_bases_at_the_end() {
+        assert_eq!(
+            Variant::new("1", 100, "ACG", "ATG").to_spdi(),
+            spdi("1", 100, 1, "T")
+        );
+        assert_eq!(
+            Variant::new("1", 100, "CAT", "CT").to_spdi(),
+            spdi("1", 100, 1, "")
+        );
+    }
+
+    #[test]
+    fn to_spdi_keeps_complex_changes() {
+        assert_eq!(
+            Variant::new("X", 400, "GCA", "TTAG").to_spdi(),
+            spdi("X", 399, 3, "TTAG")
+        );
+    }
+
+    #[test]
+    fn to_spdi_accepts_left_aligned_repeats() {
+        assert_eq!(
+            Variant::new("1", 100, "ATT", "AT").to_spdi(),
+            spdi("1", 100, 1, "")
+        );
+        assert_eq!(
+            Variant::new("1", 100, "CAGAG", "CAG").to_spdi(),
+            spdi("1", 100, 2, "")
+        );
+        assert_eq!(
+            Variant::new("1", 100, "CAT", "CAAT").to_spdi(),
+            spdi("1", 100, 0, "A")
+        );
+    }
+
+    #[test]
+    fn to_spdi_rejects_shiftable_indels() {
+        // Deleting or inserting an A next to another A can be shifted to the left.
+        assert_eq!(Variant::new("1", 100, "AA", "A").to_spdi(), None);
+        assert_eq!(Variant::new("1", 100, "A", "AA").to_spdi(), None);
+        assert_eq!(Variant::new("1", 100, "TAT", "TATAT").to_spdi(), None);
+        // Without a shared first base the alignment is unknown.
+        assert_eq!(Variant::new("1", 100, "AC", "C").to_spdi(), None);
+        // Left-aligned versions of the above.
+        assert_eq!(
+            Variant::new("1", 100, "CA", "C").to_spdi(),
+            spdi("1", 100, 1, "")
+        );
+        assert_eq!(
+            Variant::new("1", 100, "C", "CAT").to_spdi(),
+            spdi("1", 100, 0, "AT")
+        );
+    }
+
+    #[test]
+    fn to_spdi_normalizes_chromosome_and_case() {
+        assert_eq!(
+            Variant::new("chrMT", 10, "a", "g").to_spdi(),
+            spdi("M", 9, 1, "G")
+        );
+        assert_eq!(
+            Variant::new("MT", 10, "A", "G").to_spdi(),
+            spdi("M", 9, 1, "G")
+        );
+        assert_eq!(
+            Variant::new("chrM", 10, "A", "G").to_spdi(),
+            spdi("M", 9, 1, "G")
+        );
+    }
+
+    #[test]
+    fn to_spdi_rejects_unsupported_variants() {
+        assert_eq!(Variant::new("1", 100, "A", "N").to_spdi(), None);
+        assert_eq!(Variant::new("1", 100, "A", "*").to_spdi(), None);
+        assert_eq!(Variant::new("1", 100, "A", "<DEL>").to_spdi(), None);
+        assert_eq!(Variant::new("1", 100, "A", "A").to_spdi(), None);
+        assert_eq!(Variant::new("1", 0, "A", "G").to_spdi(), None);
+        assert_eq!(
+            Variant::new("chr1_KI270706v1_random", 100, "A", "G").to_spdi(),
+            None
+        );
+        assert_eq!(Variant::new("GL000192.1", 100, "A", "G").to_spdi(), None);
+        assert_eq!(Variant::new("23", 100, "A", "G").to_spdi(), None);
     }
 
     #[test]

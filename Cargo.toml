@@ -2,10 +2,11 @@
 name = "genebears"
 version = "0.3.0"
 edition = "2021"
+rust-version = "1.89"
 authors = [
     "Felix Wiegand <felix.wiegand@tu-dortmund.de>",
 ]
-description = "Lightweight Rust client for the GeneBe genetic variant annotation API with DuckDB caching and rate limiting"
+description = "Lightweight Rust client for the GeneBe variant annotation API and GeneBe Hub databases, with DuckDB caching and rate limiting"
 license = "MIT"
 readme = "README.md"
 keywords = ["genetics", "bioinformatics", "variants", "annotation", "genomics"]
@@ -18,9 +19,12 @@ serde       = { version = "1", features = ["derive"] }
 serde_json  = "1"
 tokio = { version = "1", features = ["full"] }
 thiserror = "2"
-duckdb = { version = "1.10500", features = ["bundled"] }
+duckdb = { version = "1.10500", features = ["bundled", "parquet"] }
 tracing = "0.1"
 clap = { version = "4", features = ["derive"] }
+toml = { version = "1", features = ["serde"] }
+xxhash-rust = { version = "0.8", features = ["xxh32"] }
+semver = "1"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "macros"] }
