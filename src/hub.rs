@@ -64,9 +64,7 @@ impl DatabaseId {
 }
 
 fn invalid_id(id: impl fmt::Display) -> GeneBearError {
-    GeneBearError::Other(format!(
-        "Invalid GeneBe Hub database id {id}, expected owner/name[:version]"
-    ))
+    GeneBearError::InvalidDatabaseId(id.to_string())
 }
 
 impl FromStr for DatabaseId {

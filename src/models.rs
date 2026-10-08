@@ -1,5 +1,10 @@
+use std::fmt;
+use std::str::FromStr;
+use std::sync::Arc;
+
 use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 /// Reference genome assembly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default, ValueEnum)]
@@ -54,15 +59,22 @@ impl Variant {
         }
     }
 
-    pub fn cache_key(&self, genome: Genome) -> String {
-        format!(
+    /// Key of the API record of this variant in the cache. Options are part of the key since
+    /// they change the record.
+    pub(crate) fn cache_key(&self, genome: Genome, opts: AnnotateOptions) -> String {
+        let mut key = format!(
             "{}:{}:{}:{}:{}",
             self.chr,
             self.pos,
             self.ref_allele,
             self.alt_allele,
             genome.as_str()
-        )
+        );
+        for (name, _) in opts.params() {
+            key.push(':');
+            key.push_str(name);
+        }
+        key
     }
 
     /// Convert into the key of GeneBe Hub databases: chromosome without `chr`, 0-based
@@ -158,7 +170,7 @@ pub(crate) struct Spdi {
 ///
 /// All fields default to `false` / `None`, which means the API returns
 /// everything.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct AnnotateOptions {
     /// Use only RefSeq transcripts.
     pub use_refseq: Option<bool>,
@@ -176,11 +188,138 @@ pub struct AnnotateOptions {
     pub all_genes: bool,
 }
 
+impl AnnotateOptions {
+    /// Query parameters of the options that are set.
+    pub(crate) fn params(&self) -> Vec<(&'static str, &'static str)> {
+        [
+            ("useRefseq", self.use_refseq == Some(true)),
+            ("useEnsembl", self.use_ensembl == Some(true)),
+            ("omitAcmg", self.omit_acmg),
+            ("omitCsq", self.omit_csq),
+            ("omitBasic", self.omit_basic),
+            ("omitAdvanced", self.omit_advanced),
+            ("allGenes", self.all_genes),
+        ]
+        .into_iter()
+        .filter(|(_, set)| *set)
+        .map(|(name, _)| (name, "true"))
+        .collect()
+    }
+}
+
+/// Annotation of a variant as returned by the GeneBe API, with every API field as key.
+pub(crate) type Record = serde_json::Map<String, Value>;
+
 /// Top-level response envelope returned by the GeneBe API.
 #[derive(Debug, Deserialize)]
 pub(crate) struct ApiResponse {
-    pub variants: Vec<AnnotatedVariant>,
-    pub _message: Option<String>,
+    pub variants: Vec<Record>,
+}
+
+/// A value to annotate variants with. Written as `name` for API fields and as
+/// `owner/name[:version]/column` for Hub columns, e.g. `@genebe/cadd_hg38/phred`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum Field {
+    /// Field of the GeneBe API response, e.g. `acmg_score`. Fields that GeneBe takes from Hub
+    /// databases, e.g. `revel_score`, are read from the store if the database is installed.
+    Api(String),
+    /// Column of a GeneBe Hub database, e.g. `phred` of `@genebe/cadd_hg38`. The database has
+    /// to be installed in the store. Without a version in its id, the newest installed one
+    /// is used.
+    Hub { database: String, column: String },
+}
+
+impl Field {
+    pub fn api(name: impl Into<String>) -> Self {
+        Field::Api(name.into())
+    }
+
+    pub fn hub(database: impl Into<String>, column: impl Into<String>) -> Self {
+        Field::Hub {
+            database: database.into(),
+            column: column.into(),
+        }
+    }
+}
+
+impl FromStr for Field {
+    type Err = std::convert::Infallible;
+
+    fn from_str(field: &str) -> Result<Self, Self::Err> {
+        // Database ids contain one slash, so the column follows the second one.
+        Ok(match field.rsplit_once('/') {
+            Some((database, column)) if database.contains('/') => Field::hub(database, column),
+            _ => Field::api(field),
+        })
+    }
+}
+
+impl fmt::Display for Field {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Field::Api(name) => write!(f, "{name}"),
+            Field::Hub { database, column } => write!(f, "{database}/{column}"),
+        }
+    }
+}
+
+/// Why a variant could not be annotated completely.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Warning {
+    /// Warning of the GeneBe API, e.g. a reference allele that does not match the genome.
+    Api(String),
+    /// The variant could not be looked up in Hub databases, e.g. an indel that is not
+    /// left-aligned, so Hub columns have no value.
+    NotLookedUp,
+}
+
+impl fmt::Display for Warning {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Warning::Api(message) => write!(f, "{message}"),
+            Warning::NotLookedUp => write!(
+                f,
+                "Not looked up in GeneBe Hub databases: unsupported chromosome or alleles, \
+                 or indel not left-aligned"
+            ),
+        }
+    }
+}
+
+/// Values of the requested fields for one variant.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Annotation {
+    pub(crate) fields: Arc<[Field]>,
+    pub(crate) values: Vec<Value>,
+    pub warnings: Vec<Warning>,
+}
+
+impl Annotation {
+    /// The value of a field, `None` if the variant has none or the field was not requested.
+    pub fn get(&self, field: &Field) -> Option<&Value> {
+        let index = self.fields.iter().position(|f| f == field)?;
+        Some(&self.values[index]).filter(|value| !value.is_null())
+    }
+
+    /// The requested fields.
+    pub fn fields(&self) -> &[Field] {
+        &self.fields
+    }
+
+    /// The values in the order of the requested fields, `Null` where the variant has none.
+    pub fn values(&self) -> &[Value] {
+        &self.values
+    }
+
+    pub fn f64(&self, field: &Field) -> Option<f64> {
+        self.get(field)?.as_f64()
+    }
+
+    pub fn str(&self, field: &Field) -> Option<&str> {
+        self.get(field)?.as_str()
+    }
 }
 
 /// Full annotation for one variant, as returned by GeneBe.
@@ -327,26 +466,79 @@ mod tests {
     #[test]
     fn variant_cache_key_format() {
         let v = Variant::new("22", 28_695_868, "AG", "A");
-        let key = v.cache_key(Genome::Hg38);
+        let key = v.cache_key(Genome::Hg38, AnnotateOptions::default());
         assert_eq!(key, "22:28695868:AG:A:hg38");
     }
 
     #[test]
     fn variant_cache_key_differs_by_genome() {
         let v = Variant::new("1", 100, "C", "T");
-        let k38 = v.cache_key(Genome::Hg38);
-        let k19 = v.cache_key(Genome::Hg19);
-        let kt2t = v.cache_key(Genome::T2t);
+        let k38 = v.cache_key(Genome::Hg38, AnnotateOptions::default());
+        let k19 = v.cache_key(Genome::Hg19, AnnotateOptions::default());
+        let kt2t = v.cache_key(Genome::T2t, AnnotateOptions::default());
         assert_ne!(k38, k19);
         assert_ne!(k38, kt2t);
         assert_ne!(k19, kt2t);
     }
 
     #[test]
+    fn variant_cache_key_contains_options() {
+        let v = Variant::new("22", 28_695_868, "AG", "A");
+        let opts = AnnotateOptions {
+            omit_acmg: true,
+            use_refseq: Some(true),
+            ..Default::default()
+        };
+        assert_eq!(
+            v.cache_key(Genome::Hg38, opts),
+            "22:28695868:AG:A:hg38:useRefseq:omitAcmg"
+        );
+    }
+
+    #[test]
     fn variant_cache_key_differs_by_position() {
         let a = Variant::new("1", 100, "C", "T");
         let b = Variant::new("1", 101, "C", "T");
-        assert_ne!(a.cache_key(Genome::Hg38), b.cache_key(Genome::Hg38));
+        let opts = AnnotateOptions::default();
+        assert_ne!(
+            a.cache_key(Genome::Hg38, opts),
+            b.cache_key(Genome::Hg38, opts)
+        );
+    }
+
+    #[test]
+    fn field_parses_and_displays() {
+        for (text, field) in [
+            ("acmg_score", Field::api("acmg_score")),
+            (
+                "@genebe/cadd_hg38/phred",
+                Field::hub("@genebe/cadd_hg38", "phred"),
+            ),
+            (
+                "@genebe/cadd_hg38:0.0.2/phred",
+                Field::hub("@genebe/cadd_hg38:0.0.2", "phred"),
+            ),
+        ] {
+            assert_eq!(text.parse::<Field>().unwrap(), field);
+            assert_eq!(field.to_string(), text);
+        }
+    }
+
+    #[test]
+    fn annotation_returns_values_of_requested_fields() {
+        let revel = Field::api("revel_score");
+        let cadd = Field::hub("@genebe/cadd_hg38", "phred");
+        let gene = Field::api("gene_symbol");
+        let annotation = Annotation {
+            fields: vec![revel.clone(), cadd.clone(), gene.clone()].into(),
+            values: vec![0.5.into(), Value::Null, "BRCA1".into()],
+            warnings: Vec::new(),
+        };
+
+        assert_eq!(annotation.f64(&revel), Some(0.5));
+        assert_eq!(annotation.get(&cadd), None);
+        assert_eq!(annotation.str(&gene), Some("BRCA1"));
+        assert_eq!(annotation.get(&Field::api("acmg_score")), None);
     }
 
     #[test]

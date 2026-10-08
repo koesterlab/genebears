@@ -6,51 +6,35 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use duckdb::{params, Connection};
-use tracing::{debug, warn};
+use serde_json::{Number, Value};
+use tracing::warn;
 
 use crate::error::GeneBearError;
-use crate::hub::Database;
-use crate::models::{AnnotatedVariant, Genome, Spdi, Variant};
+use crate::hub::{Database, DatabaseId};
+use crate::models::{Field, Genome, Spdi};
 
-/// A field of [`AnnotatedVariant`] that is read from a column of a Hub database.
-struct Field {
-    database: &'static str,
-    column: &'static str,
-    field: fn(&mut AnnotatedVariant) -> &mut Option<f64>,
-}
-
-/// Fields filled from hg38 Hub databases. Their values agree with the GeneBe API, which takes
-/// them from the same databases. There are none for hg19, since the API lifts hg19 variants
-/// over to hg38 and thus differs from e.g. `@genebe/revel_hg19`.
-const FIELDS: [Field; 5] = [
-    Field {
-        database: "revel",
-        column: "score",
-        field: |a| &mut a.revel_score,
-    },
-    Field {
-        database: "alpha_missense",
-        column: "am_pathogenicity",
-        field: |a| &mut a.alphamissense_score,
-    },
-    Field {
-        database: "spliceai",
-        column: "max",
-        field: |a| &mut a.spliceai_max_score,
-    },
-    Field {
-        database: "gnomad_exomes4",
-        column: "AF",
-        field: |a| &mut a.gnomad_exomes_af,
-    },
-    Field {
-        database: "gnomad_genomes4",
-        column: "AF",
-        field: |a| &mut a.gnomad_genomes_af,
-    },
+/// API fields that GeneBe takes from columns of hg38 Hub databases, so that installed
+/// databases can serve them. There are none for hg19, since the API lifts hg19 variants over
+/// to hg38 and thus differs from e.g. `@genebe/revel_hg19`.
+const API_FIELDS: [(&str, &str, &str); 9] = [
+    ("revel_score", "@genebe/revel", "score"),
+    (
+        "alphamissense_score",
+        "@genebe/alpha_missense",
+        "am_pathogenicity",
+    ),
+    ("spliceai_max_score", "@genebe/spliceai", "max"),
+    ("gnomad_exomes_af", "@genebe/gnomad_exomes4", "AF"),
+    ("gnomad_exomes_ac", "@genebe/gnomad_exomes4", "AC"),
+    ("gnomad_exomes_homalt", "@genebe/gnomad_exomes4", "nhomalt"),
+    ("gnomad_genomes_af", "@genebe/gnomad_genomes4", "AF"),
+    ("gnomad_genomes_ac", "@genebe/gnomad_genomes4", "AC"),
+    (
+        "gnomad_genomes_homalt",
+        "@genebe/gnomad_genomes4",
+        "nhomalt",
+    ),
 ];
-
-const OWNER: &str = "@genebe";
 
 /// A database installed in a [`Store`].
 #[derive(Debug, Clone)]
@@ -123,27 +107,46 @@ impl Store {
         Ok(Some(Installed { path, database }))
     }
 
-    /// The newest installed version of a database.
-    pub(crate) fn newest(
-        &self,
-        owner: &str,
-        name: &str,
-    ) -> Result<Option<Installed>, GeneBearError> {
-        let versions = visible_directories(&self.root.join(owner).join(name))?;
+    /// The installed database with the version of `id`, or the newest one if it has none.
+    pub(crate) fn find(&self, id: &DatabaseId) -> Result<Option<Installed>, GeneBearError> {
+        if let Some(version) = &id.version {
+            return self.get(&id.owner, &id.name, version);
+        }
+        let versions = visible_directories(&self.root.join(&id.owner).join(&id.name))?;
         // Versions that are not semantic versions count as the oldest.
         let newest = versions
             .iter()
             .max_by_key(|version| (semver::Version::parse(version).ok(), *version));
         match newest {
-            Some(version) => match self.get(owner, name, version)? {
+            Some(version) => match self.get(&id.owner, &id.name, version)? {
                 Some(installed) => Ok(Some(installed)),
                 None => Err(GeneBearError::Other(format!(
                     "{} has no description.toml",
-                    self.path(owner, name, version).display()
+                    self.path(&id.owner, &id.name, version).display()
                 ))),
             },
             None => Ok(None),
         }
+    }
+
+    /// The installed database and column the API takes a field from.
+    pub(crate) fn api_field(
+        &self,
+        field: &str,
+        genome: Genome,
+    ) -> Result<Option<(Installed, &'static str)>, GeneBearError> {
+        let Some((_, database, column)) = API_FIELDS.iter().find(|(name, ..)| *name == field)
+        else {
+            return Ok(None);
+        };
+        if genome != Genome::Hg38 {
+            return Ok(None);
+        }
+        let Some(installed) = self.find(&database.parse()?)? else {
+            return Ok(None);
+        };
+        check_column(&installed, column, genome)?;
+        Ok(Some((installed, column)))
     }
 
     /// All installed database versions. Directories without a readable `description.toml`
@@ -163,100 +166,52 @@ impl Store {
         }
         Ok(installed)
     }
-
-    /// Annotate hg38 variants from the installed databases, without contacting GeneBe.
-    /// Results are returned in the same order as `variants`.
-    ///
-    /// Fills `revel_score`, `alphamissense_score`, `spliceai_max_score`, `gnomad_exomes_af`
-    /// and `gnomad_genomes_af` from `@genebe/revel`, `@genebe/alpha_missense`,
-    /// `@genebe/spliceai`, `@genebe/gnomad_exomes4` and `@genebe/gnomad_genomes4`. Fields of
-    /// databases that are not installed stay empty. Reference alleles are not checked
-    /// against the genome. Variants that cannot be looked up, e.g. indels that are not
-    /// left-aligned, get a `warning`.
-    ///
-    /// Hub databases are read in blocks of whole chromosomes, so annotate variants in large
-    /// batches rather than one by one. This blocks, use `tokio::task::spawn_blocking` in
-    /// async code.
-    pub fn annotate_variants(
-        &self,
-        variants: &[Variant],
-        genome: Genome,
-    ) -> Result<Vec<AnnotatedVariant>, GeneBearError> {
-        if genome != Genome::Hg38 {
-            return Err(GeneBearError::Other(format!(
-                "Local annotation is only available for hg38, not {}",
-                genome.as_str()
-            )));
-        }
-        let keys: Vec<Option<Spdi>> = variants.iter().map(Variant::to_spdi).collect();
-        let mut annotations: Vec<AnnotatedVariant> = variants
-            .iter()
-            .zip(&keys)
-            .map(|(variant, key)| AnnotatedVariant {
-                chr: Some(variant.chr.clone()),
-                pos: Some(variant.pos),
-                ref_allele: Some(variant.ref_allele.clone()),
-                alt: Some(variant.alt_allele.clone()),
-                warning: key.is_none().then(|| {
-                    "Not looked up in GeneBe Hub databases: unsupported chromosome or alleles, \
-                     or indel not left-aligned"
-                        .into()
-                }),
-                ..Default::default()
-            })
-            .collect();
-
-        let conn = Connection::open_in_memory()?;
-        for field in &FIELDS {
-            let installed = match self.newest(OWNER, field.database) {
-                Ok(Some(installed)) => installed,
-                Ok(None) => {
-                    debug!("{OWNER}/{} is not installed", field.database);
-                    continue;
-                }
-                Err(e) => {
-                    warn!("Skipping {OWNER}/{}: {e}", field.database);
-                    continue;
-                }
-            };
-            if !installed
-                .database
-                .columns
-                .iter()
-                .any(|c| c.name == field.column)
-            {
-                warn!(
-                    "Skipping {}: no column {}",
-                    installed.database.id(),
-                    field.column
-                );
-                continue;
-            }
-            debug!(
-                "Annotating {} from {}",
-                field.column,
-                installed.database.id()
-            );
-            let parquet = installed.path.join("parquet");
-            for (index, value) in lookup(&conn, &parquet, field.column, &keys)? {
-                *(field.field)(&mut annotations[index]) = value;
-            }
-        }
-        Ok(annotations)
-    }
 }
 
-/// Look up a column for the given variants in a hive-partitioned parquet database and
-/// return the values by index into `keys`.
-fn lookup(
-    conn: &Connection,
-    parquet: &Path,
+/// Check that a database has the column and matches the genome.
+pub(crate) fn check_column(
+    installed: &Installed,
     column: &str,
+    genome: Genome,
+) -> Result<(), GeneBearError> {
+    let database = &installed.database;
+    if let Some(kind) = database.kind.as_deref().filter(|kind| *kind != "VARIANT") {
+        return Err(GeneBearError::Other(format!(
+            "{} is a {kind} database, only VARIANT databases are supported",
+            database.id()
+        )));
+    }
+    if !database.columns.iter().any(|c| c.name == column) {
+        return Err(GeneBearError::UnknownField {
+            field: Field::hub(database.id().to_string(), column),
+        });
+    }
+    let expected = match genome {
+        Genome::Hg38 => "GRCh38",
+        Genome::Hg19 => "GRCh37",
+        Genome::T2t => "T2T",
+    };
+    // Some databases have other values than genome builds here.
+    if let Some(build @ ("GRCh37" | "GRCh38")) = database.genome.as_deref() {
+        if build != expected {
+            return Err(GeneBearError::GenomeMismatch {
+                database: database.id(),
+                genome,
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Look up columns of installed databases. Returns `(variant, field, value)`, with
+/// `variant` an index into `keys` and `field` the index given with the column.
+pub(crate) fn lookup(
+    local: &[(Installed, Vec<(usize, String)>)],
     keys: &[Option<Spdi>],
-) -> Result<Vec<(usize, Option<f64>)>, GeneBearError> {
+) -> Result<Vec<(usize, usize, Value)>, GeneBearError> {
+    let conn = Connection::open_in_memory()?;
     conn.execute_batch(
-        "CREATE OR REPLACE TEMP TABLE query \
-         (idx UINTEGER, seq VARCHAR, pos BIGINT, del BIGINT, ins VARCHAR)",
+        "CREATE TEMP TABLE query (idx UINTEGER, seq VARCHAR, pos BIGINT, del BIGINT, ins VARCHAR)",
     )?;
     let mut appender = conn.appender("query")?;
     for (index, key) in keys.iter().enumerate() {
@@ -273,6 +228,28 @@ fn lookup(
     appender.flush()?;
     drop(appender);
 
+    let mut found = Vec::new();
+    for (installed, columns) in local {
+        let names: Vec<&str> = columns.iter().map(|(_, column)| column.as_str()).collect();
+        for (variant, values) in
+            lookup_columns(&conn, &installed.path.join("parquet"), &names, keys)?
+        {
+            for ((field, _), value) in columns.iter().zip(values) {
+                found.push((variant, *field, value));
+            }
+        }
+    }
+    Ok(found)
+}
+
+/// Look up columns of a hive-partitioned parquet database for the variants in the `query`
+/// table and return their values by index into `keys`.
+fn lookup_columns(
+    conn: &Connection,
+    parquet: &Path,
+    columns: &[&str],
+    keys: &[Option<Spdi>],
+) -> Result<Vec<(usize, Vec<Value>)>, GeneBearError> {
     // Querying one chromosome at a time with the range of positions lets DuckDB skip the
     // parts of the files that cannot match.
     let mut ranges: BTreeMap<&str, (u32, u32)> = BTreeMap::new();
@@ -280,34 +257,90 @@ fn lookup(
         let range = ranges.entry(key.seq.as_str()).or_insert((key.pos, key.pos));
         *range = (range.0.min(key.pos), range.1.max(key.pos));
     }
-    let mut values = Vec::new();
+    let selected = columns
+        .iter()
+        .map(|column| format!("t.\"{}\"", column.replace('"', "\"\"")))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut values: Vec<(usize, Vec<Value>)> = Vec::new();
     for (seq, (start, end)) in ranges {
         let partition = parquet.join(format!("_seq={seq}"));
         // Partitions without files would make DuckDB fail.
         if !has_parquet_files(&partition) {
             continue;
         }
-        // Values are read through their shortest decimal representation, so float32
-        // columns give the same numbers as the API, e.g. 0.034 instead of
-        // 0.03400000184774399. Keys are unique in Hub databases, max() is only a safeguard.
+        // Keys are unique in Hub databases. Should one occur twice, ordering by the first
+        // column makes the result deterministic.
         let sql = format!(
-            "SELECT query.idx, max(TRY_CAST(CAST(t.\"{column}\" AS VARCHAR) AS DOUBLE)) \
+            "SELECT query.idx, {selected} \
              FROM read_parquet({}) t \
              JOIN query ON query.seq = ? AND t._pos = query.pos AND t._del = query.del \
              AND coalesce(t._ins, '') = query.ins \
              WHERE t._pos BETWEEN ? AND ? \
-             GROUP BY query.idx",
+             ORDER BY query.idx, 2 DESC NULLS LAST",
             sql_string(&partition.join("*.parquet")),
         );
         let mut statement = conn.prepare(&sql)?;
-        let rows = statement.query_map(params![seq, start, end], |row| {
-            Ok((row.get::<_, u32>(0)? as usize, row.get(1)?))
-        })?;
-        for row in rows {
-            values.push(row?);
+        let mut rows = statement.query(params![seq, start, end])?;
+        while let Some(row) = rows.next()? {
+            let index = row.get::<_, u32>(0)? as usize;
+            if values.last().is_some_and(|(last, _)| *last == index) {
+                continue;
+            }
+            let row: Vec<Value> = (1..=columns.len())
+                .map(|i| row.get::<_, duckdb::types::Value>(i).map(json))
+                .collect::<Result<_, _>>()?;
+            values.push((index, row));
         }
     }
     Ok(values)
+}
+
+/// Convert a DuckDB value into JSON. Floats are converted through their shortest decimal
+/// representation, so float32 columns give the same numbers as the API, e.g. 0.034 instead
+/// of 0.03400000184774399.
+fn json(value: duckdb::types::Value) -> Value {
+    use duckdb::types::Value as DuckDb;
+    match value {
+        DuckDb::Null => Value::Null,
+        DuckDb::Boolean(value) => value.into(),
+        DuckDb::TinyInt(value) => value.into(),
+        DuckDb::SmallInt(value) => value.into(),
+        DuckDb::Int(value) => value.into(),
+        DuckDb::BigInt(value) => value.into(),
+        DuckDb::UTinyInt(value) => value.into(),
+        DuckDb::USmallInt(value) => value.into(),
+        DuckDb::UInt(value) => value.into(),
+        DuckDb::UBigInt(value) => value.into(),
+        DuckDb::HugeInt(value) => {
+            i64::try_from(value).map_or_else(|_| number(&value.to_string()), Value::from)
+        }
+        DuckDb::UHugeInt(value) => {
+            u64::try_from(value).map_or_else(|_| number(&value.to_string()), Value::from)
+        }
+        DuckDb::Float(value) => number(&value.to_string()),
+        DuckDb::Decimal(value) => number(&value.to_string()),
+        DuckDb::Double(value) => Number::from_f64(value).map_or(Value::Null, Value::Number),
+        DuckDb::Text(value) | DuckDb::Enum(value) => value.into(),
+        DuckDb::List(values) | DuckDb::Array(values) => values.into_iter().map(json).collect(),
+        DuckDb::Struct(fields) => Value::Object(
+            fields
+                .iter()
+                .map(|(name, value)| (name.clone(), json(value.clone())))
+                .collect(),
+        ),
+        DuckDb::Union(value) => json(*value),
+        // Not used by Hub databases.
+        other => format!("{other:?}").into(),
+    }
+}
+
+fn number(decimal: &str) -> Value {
+    decimal
+        .parse::<f64>()
+        .ok()
+        .and_then(Number::from_f64)
+        .map_or(Value::Null, Value::Number)
 }
 
 fn sql_string(path: &Path) -> String {
@@ -341,50 +374,38 @@ fn visible_directories(directory: &Path) -> Result<Vec<String>, GeneBearError> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
-    use crate::hub::{Column, DatabaseId};
+    use crate::hub::Column;
+    use crate::models::Variant;
     use tempfile::TempDir;
 
-    type Row<'a> = (&'a str, i32, i32, Option<&'a str>, f32);
-
-    fn install(store: &Store, name: &str, column: &str, rows: &[Row]) {
-        install_version(store, name, "0.0.1", column, rows);
-    }
-
-    /// Writes a VARIANT database with one float column into the store, partitioned like Hub
-    /// databases.
-    fn install_version(store: &Store, name: &str, version: &str, column: &str, rows: &[Row]) {
-        let path = store.path(OWNER, name, version);
+    /// Write a VARIANT database into the store, partitioned like Hub databases. `rows` is a
+    /// DuckDB query with the columns `_seq`, `_pos`, `_del`, `_ins` and `columns`.
+    pub(crate) fn install(store: &Store, id: &str, genome: &str, columns: &[&str], rows: &str) {
+        let id: DatabaseId = id.parse().unwrap();
+        let version = id.version.clone().unwrap_or("0.0.1".into());
+        let path = store.path(&id.owner, &id.name, &version);
         fs::create_dir_all(&path).unwrap();
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(&format!(
-            "CREATE TABLE data \
-             (_seq VARCHAR, _pos INTEGER, _del INTEGER, _ins VARCHAR, \"{column}\" FLOAT)"
-        ))
-        .unwrap();
-        let mut appender = conn.appender("data").unwrap();
-        for row in rows {
-            appender
-                .append_row(params![row.0, row.1, row.2, row.3, row.4])
-                .unwrap();
-        }
-        appender.flush().unwrap();
-        drop(appender);
-        conn.execute_batch(&format!(
-            "COPY data TO {} (FORMAT PARQUET, PARTITION_BY (_seq))",
+            "COPY ({rows}) TO {} (FORMAT PARQUET, PARTITION_BY (_seq))",
             sql_string(&path.join("parquet"))
         ))
         .unwrap();
         let database = Database {
-            owner: OWNER.into(),
-            name: name.into(),
-            version: version.into(),
+            owner: id.owner.clone(),
+            name: id.name.clone(),
+            version,
+            genome: Some(genome.into()),
             kind: Some("VARIANT".into()),
-            columns: vec![Column {
-                name: column.into(),
-                ..Default::default()
-            }],
+            columns: columns
+                .iter()
+                .map(|name| Column {
+                    name: name.to_string(),
+                    ..Default::default()
+                })
+                .collect(),
             ..Default::default()
         };
         fs::write(
@@ -394,235 +415,245 @@ mod tests {
         .unwrap();
     }
 
-    fn install_revel(store: &Store) {
+    pub(crate) fn install_revel(store: &Store) {
         install(
             store,
-            "revel",
-            "score",
-            &[
-                ("22", 99, 1, Some("T"), 0.034),
-                ("22", 99, 1, Some("G"), 0.5),
-                ("22", 200, 0, Some("TT"), 0.25),
-                ("22", 300, 2, Some(""), 0.75),
-                ("22", 400, 1, None, 0.625),
-                ("X", 99, 1, Some("T"), 0.9),
-            ],
+            "@genebe/revel:0.0.1",
+            "GRCh38",
+            &["score"],
+            "SELECT * FROM (VALUES
+                ('22', 99, 1, 'T', 0.034::FLOAT),
+                ('22', 99, 1, 'G', 0.5::FLOAT),
+                ('22', 200, 0, 'TT', 0.25::FLOAT),
+                ('22', 400, 1, NULL, 0.625::FLOAT),
+                ('X', 99, 1, 'T', 0.9::FLOAT)
+            ) AS t(_seq, _pos, _del, _ins, score)",
         );
     }
 
+    fn keys(variants: &[Variant]) -> Vec<Option<Spdi>> {
+        variants.iter().map(Variant::to_spdi).collect()
+    }
+
+    fn lookup_one(
+        store: &Store,
+        id: &str,
+        columns: &[&str],
+        variants: &[Variant],
+    ) -> Vec<(usize, usize, Value)> {
+        let installed = store.find(&id.parse().unwrap()).unwrap().unwrap();
+        let columns = columns
+            .iter()
+            .enumerate()
+            .map(|(i, c)| (i, c.to_string()))
+            .collect();
+        lookup(&[(installed, columns)], &keys(variants)).unwrap()
+    }
+
     #[test]
-    fn annotate_variants_reads_installed_databases() {
+    fn lookup_reads_columns_of_variants() {
         let dir = TempDir::new().unwrap();
         let store = Store::new(dir.path());
         install_revel(&store);
         let variants = [
             Variant::new("chrX", 100, "A", "T"),
-            Variant::new("22", 100, "A", "T"),
             Variant::new("22", 100, "A", "C"),
-            Variant::new("22", 200, "C", "CTT"),
-            Variant::new("22", 300, "GCA", "G"),
-            Variant::new("22", 400, "TA", "T"),
             Variant::new("22", 100, "A", "T"),
+            Variant::new("22", 200, "C", "CTT"),
+            Variant::new("22", 400, "TA", "T"),
             Variant::new("21", 100, "A", "T"),
-        ];
-
-        let annotations = store.annotate_variants(&variants, Genome::Hg38).unwrap();
-
-        let scores: Vec<_> = annotations.iter().map(|a| a.revel_score).collect();
-        assert_eq!(
-            scores,
-            [
-                Some(0.9),
-                Some(0.034),
-                None,
-                Some(0.25),
-                Some(0.75),
-                Some(0.625),
-                Some(0.034),
-                None
-            ]
-        );
-        assert_eq!(annotations[0].chr.as_deref(), Some("chrX"));
-        assert_eq!(annotations[0].pos, Some(100));
-        assert_eq!(annotations[0].alt.as_deref(), Some("T"));
-        assert!(annotations.iter().all(|a| a.warning.is_none()));
-        assert!(annotations.iter().all(|a| a.alphamissense_score.is_none()));
-    }
-
-    #[test]
-    fn annotate_variants_handles_many_variants() {
-        let dir = TempDir::new().unwrap();
-        let store = Store::new(dir.path());
-        install_revel(&store);
-        let mut variants = vec![Variant::new("22", 1000, "A", "T"); 2500];
-        variants[0] = Variant::new("22", 100, "A", "T");
-        variants[1001] = Variant::new("22", 100, "A", "G");
-        variants[2499] = Variant::new("X", 100, "A", "T");
-
-        let annotations = store.annotate_variants(&variants, Genome::Hg38).unwrap();
-
-        let hits: Vec<_> = annotations
-            .iter()
-            .enumerate()
-            .filter_map(|(i, a)| a.revel_score.map(|score| (i, score)))
-            .collect();
-        assert_eq!(hits, [(0, 0.034), (1001, 0.5), (2499, 0.9)]);
-    }
-
-    #[test]
-    fn annotate_variants_warns_on_unsupported() {
-        let dir = TempDir::new().unwrap();
-        let store = Store::new(dir.path());
-        install_revel(&store);
-        let variants = [
             Variant::new("22", 100, "AA", "A"),
-            Variant::new("22", 100, "A", "N"),
         ];
 
-        let annotations = store.annotate_variants(&variants, Genome::Hg38).unwrap();
+        let found = lookup_one(&store, "@genebe/revel", &["score"], &variants);
 
-        assert!(annotations.iter().all(|a| a.warning.is_some()));
-        assert!(annotations.iter().all(|a| a.revel_score.is_none()));
+        let mut scores: Vec<_> = found
+            .iter()
+            .map(|(v, _, value)| (*v, value.as_f64().unwrap()))
+            .collect();
+        scores.sort_by_key(|(v, _)| *v);
+        assert_eq!(scores, [(0, 0.9), (2, 0.034), (3, 0.25), (4, 0.625)]);
     }
 
     #[test]
-    fn annotate_variants_without_databases() {
-        let dir = TempDir::new().unwrap();
-        let store = Store::new(dir.path().join("missing"));
-
-        let annotations = store
-            .annotate_variants(&[Variant::new("22", 100, "A", "T")], Genome::Hg38)
-            .unwrap();
-
-        assert_eq!(annotations.len(), 1);
-        assert_eq!(annotations[0].chr.as_deref(), Some("22"));
-        assert!(annotations[0].revel_score.is_none());
-        assert!(annotations[0].warning.is_none());
-    }
-
-    #[test]
-    fn annotate_variants_refuses_other_genomes() {
-        let dir = TempDir::new().unwrap();
-        let store = Store::new(dir.path());
-        install_revel(&store);
-        let variants = [Variant::new("22", 100, "A", "T")];
-
-        assert!(store.annotate_variants(&variants, Genome::Hg19).is_err());
-        assert!(store.annotate_variants(&variants, Genome::T2t).is_err());
-    }
-
-    #[test]
-    fn annotate_variants_handles_paths_with_special_characters() {
-        let dir = TempDir::new().unwrap();
-        let store = Store::new(dir.path().join("Application Support").join("Felix's"));
-        install_revel(&store);
-
-        let annotations = store
-            .annotate_variants(&[Variant::new("22", 100, "A", "T")], Genome::Hg38)
-            .unwrap();
-
-        assert_eq!(annotations[0].revel_score, Some(0.034));
-    }
-
-    #[test]
-    fn annotate_variants_skips_databases_without_column() {
-        let dir = TempDir::new().unwrap();
-        let store = Store::new(dir.path());
-        install(&store, "revel", "other", &[("22", 99, 1, Some("T"), 0.5)]);
-
-        let annotations = store
-            .annotate_variants(&[Variant::new("22", 100, "A", "T")], Genome::Hg38)
-            .unwrap();
-
-        assert_eq!(annotations[0].revel_score, None);
-    }
-
-    #[test]
-    fn annotate_variants_skips_unreadable_databases() {
-        let dir = TempDir::new().unwrap();
-        let store = Store::new(dir.path());
-        install_revel(&store);
-        install(&store, "spliceai", "max", &[("22", 99, 1, Some("T"), 0.5)]);
-        let description = store
-            .path(OWNER, "spliceai", "0.0.1")
-            .join("description.toml");
-        fs::write(description, "columns = 1").unwrap();
-
-        let annotations = store
-            .annotate_variants(&[Variant::new("22", 100, "A", "T")], Genome::Hg38)
-            .unwrap();
-
-        assert_eq!(annotations[0].revel_score, Some(0.034));
-        assert_eq!(annotations[0].spliceai_max_score, None);
-    }
-
-    #[test]
-    fn lookup_takes_max_of_duplicates() {
+    fn lookup_keeps_column_types() {
         let dir = TempDir::new().unwrap();
         let store = Store::new(dir.path());
         install(
             &store,
-            "spliceai",
-            "max",
-            &[
-                ("22", 99, 1, Some("T"), 0.25),
-                ("22", 99, 1, Some("T"), 0.5),
-            ],
+            "@genebe/clinvar",
+            "GRCh38",
+            &["significance", "stars", "diseases", "frequency"],
+            "SELECT '1' AS _seq, 99 AS _pos, 1 AS _del, 'T' AS _ins, 'Pathogenic' AS significance,
+                    2::SMALLINT AS stars, ['A', 'B'] AS diseases, 0.1::FLOAT AS frequency",
         );
-        let keys = [Variant::new("22", 100, "A", "T").to_spdi()];
-        let parquet = store.path(OWNER, "spliceai", "0.0.1").join("parquet");
 
-        let conn = Connection::open_in_memory().unwrap();
-        let values = lookup(&conn, &parquet, "max", &keys).unwrap();
+        let found = lookup_one(
+            &store,
+            "@genebe/clinvar",
+            &["significance", "stars", "diseases", "frequency"],
+            &[Variant::new("1", 100, "A", "T")],
+        );
 
-        assert_eq!(values, [(0, Some(0.5))]);
+        let values: Vec<_> = found.into_iter().map(|(_, _, value)| value).collect();
+        assert_eq!(
+            values,
+            [
+                Value::from("Pathogenic"),
+                Value::from(2),
+                serde_json::json!(["A", "B"]),
+                Value::from(0.1)
+            ]
+        );
     }
 
     #[test]
-    fn annotate_variants_skips_chromosomes_without_data() {
+    fn lookup_takes_one_row_of_duplicate_keys() {
         let dir = TempDir::new().unwrap();
         let store = Store::new(dir.path());
-        install(&store, "revel", "score", &[("1", 99, 1, Some("T"), 0.5)]);
-        let variants = [
-            Variant::new("X", 100, "A", "T"),
-            Variant::new("1", 100, "A", "T"),
-        ];
+        install(
+            &store,
+            "@genebe/spliceai",
+            "GRCh38",
+            &["max", "gene"],
+            "SELECT * FROM (VALUES ('22', 99, 1, 'T', 0.25, 'A'), ('22', 99, 1, 'T', 0.5, 'B'))
+                AS t(_seq, _pos, _del, _ins, max, gene)",
+        );
 
-        let annotations = store.annotate_variants(&variants, Genome::Hg38).unwrap();
+        let found = lookup_one(
+            &store,
+            "@genebe/spliceai",
+            &["max", "gene"],
+            &[Variant::new("22", 100, "A", "T")],
+        );
 
-        assert_eq!(annotations[0].revel_score, None);
-        assert_eq!(annotations[1].revel_score, Some(0.5));
+        let values: Vec<_> = found.into_iter().map(|(_, _, value)| value).collect();
+        assert_eq!(values, [Value::from(0.5), Value::from("B")]);
     }
 
     #[test]
-    fn annotate_variants_uses_newest_version() {
+    fn lookup_handles_paths_with_special_characters() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::new(dir.path().join("Application Support").join("Felix's"));
+        install_revel(&store);
+
+        let found = lookup_one(
+            &store,
+            "@genebe/revel",
+            &["score"],
+            &[Variant::new("22", 100, "A", "T")],
+        );
+
+        assert_eq!(found, [(0, 0, Value::from(0.034))]);
+    }
+
+    #[test]
+    fn find_uses_newest_or_given_version() {
         let dir = TempDir::new().unwrap();
         let store = Store::new(dir.path());
-        for (version, score) in [("0.0.2", 0.25), ("0.0.10", 0.5), ("0.0.10-1", 0.125)] {
-            install_version(
+        for version in ["0.0.2", "0.0.10", "0.0.10-1", "unversioned"] {
+            install(
                 &store,
-                "revel",
-                version,
-                "score",
-                &[("22", 99, 1, Some("T"), score)],
+                &format!("@genebe/revel:{version}"),
+                "GRCh38",
+                &["score"],
+                "SELECT '1' AS _seq, 1 AS _pos, 1 AS _del, 'A' AS _ins, 0.5 AS score",
             );
         }
 
-        let annotations = store
-            .annotate_variants(&[Variant::new("22", 100, "A", "T")], Genome::Hg38)
-            .unwrap();
+        let version = |id: &str| {
+            store
+                .find(&id.parse().unwrap())
+                .unwrap()
+                .unwrap()
+                .database
+                .version
+        };
 
-        assert_eq!(annotations[0].revel_score, Some(0.5));
+        assert_eq!(version("@genebe/revel"), "0.0.10");
+        assert_eq!(version("@genebe/revel:0.0.2"), "0.0.2");
+        assert!(store
+            .find(&"@genebe/revel:0.0.3".parse().unwrap())
+            .unwrap()
+            .is_none());
+        assert!(store
+            .find(&"@genebe/spliceai".parse().unwrap())
+            .unwrap()
+            .is_none());
     }
 
     #[test]
-    fn newest_reports_broken_versions() {
+    fn find_reports_broken_versions() {
         let dir = TempDir::new().unwrap();
         let store = Store::new(dir.path());
         install_revel(&store);
-        fs::create_dir_all(store.path(OWNER, "revel", "0.0.2")).unwrap();
+        fs::create_dir_all(store.path("@genebe", "revel", "0.0.2")).unwrap();
 
-        assert!(store.newest(OWNER, "revel").is_err());
+        assert!(store.find(&"@genebe/revel".parse().unwrap()).is_err());
+    }
+
+    #[test]
+    fn api_field_finds_hg38_databases() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::new(dir.path());
+        install_revel(&store);
+
+        let (installed, column) = store
+            .api_field("revel_score", Genome::Hg38)
+            .unwrap()
+            .unwrap();
+        assert_eq!(installed.database.name, "revel");
+        assert_eq!(column, "score");
+        assert!(store
+            .api_field("revel_score", Genome::Hg19)
+            .unwrap()
+            .is_none());
+        assert!(store
+            .api_field("spliceai_max_score", Genome::Hg38)
+            .unwrap()
+            .is_none());
+        assert!(store
+            .api_field("acmg_score", Genome::Hg38)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn check_rejects_unknown_columns_and_other_genomes() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::new(dir.path());
+        install(
+            &store,
+            "@genebe/revel_hg19",
+            "GRCh37",
+            &["score"],
+            "SELECT '1' AS _seq, 1 AS _pos, 1 AS _del, 'A' AS _ins, 0.5 AS score",
+        );
+        let installed = store
+            .find(&"@genebe/revel_hg19".parse().unwrap())
+            .unwrap()
+            .unwrap();
+
+        assert!(check_column(&installed, "score", Genome::Hg19).is_ok());
+        assert!(matches!(
+            check_column(&installed, "phred", Genome::Hg19),
+            Err(GeneBearError::UnknownField { .. })
+        ));
+        assert!(check_column(&installed, "score", Genome::Hg38).is_err());
+    }
+
+    #[test]
+    fn check_rejects_other_database_types() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::new(dir.path());
+        install_revel(&store);
+        let mut installed = store
+            .find(&"@genebe/revel".parse().unwrap())
+            .unwrap()
+            .unwrap();
+        installed.database.kind = Some("POSITION".into());
+
+        assert!(check_column(&installed, "score", Genome::Hg38).is_err());
     }
 
     #[test]
@@ -630,36 +661,36 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let store = Store::new(dir.path());
         install_revel(&store);
-        let temp = dir.path().join("__temp/genebears").join(OWNER);
+        let temp = dir.path().join("__temp/genebears/@genebe");
         fs::create_dir_all(temp.join("spliceai/0.0.1/parquet")).unwrap();
         fs::write(temp.join("spliceai.lock"), "").unwrap();
-        fs::create_dir_all(dir.path().join(OWNER).join(".hidden/0.0.1")).unwrap();
-        fs::create_dir_all(dir.path().join(OWNER).join("empty/0.0.1")).unwrap();
+        fs::create_dir_all(dir.path().join("@genebe/.hidden/0.0.1")).unwrap();
+        fs::create_dir_all(dir.path().join("@genebe/empty/0.0.1")).unwrap();
 
         let installed = store.installed().unwrap();
 
         assert_eq!(installed.len(), 1);
         assert_eq!(
-            installed[0].database.id(),
-            "@genebe/revel:0.0.1".parse::<DatabaseId>().unwrap()
+            installed[0].database.id().to_string(),
+            "@genebe/revel:0.0.1"
         );
         assert_eq!(installed[0].path, dir.path().join("@genebe/revel/0.0.1"));
     }
 
-    /// Checks that the databases and columns used for annotation still exist on the Hub.
+    /// Checks that the databases and columns the API takes fields from still exist on the
+    /// Hub.
     #[tokio::test]
     #[ignore = "needs the GeneBe Hub"]
-    async fn fields_exist_on_hub() {
+    async fn api_fields_exist_on_hub() {
         let hub = crate::GeneBears::new(crate::ClientConfig::default())
             .unwrap()
             .hub();
-        for field in &FIELDS {
-            let id = DatabaseId::new(OWNER, field.database);
-            let database = hub.database(&id).await.unwrap();
+        for (_, database, column) in API_FIELDS {
+            let database = hub.database(&database.parse().unwrap()).await.unwrap();
             assert!(
-                database.columns.iter().any(|c| c.name == field.column),
-                "{id} has no column {}",
-                field.column
+                database.columns.iter().any(|c| c.name == column),
+                "{} has no column {column}",
+                database.id()
             );
         }
     }

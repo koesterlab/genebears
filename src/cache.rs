@@ -1,7 +1,7 @@
 //! DuckDB based persistent cache for variant annotations.
 //!
-//! Each variant is keyed by `chr:pos:ref:alt:genome`.  The full
-//! [`AnnotatedVariant`] is stored as a JSON string.
+//! Each variant is keyed by `chr:pos:ref:alt:genome` and the options that were set. The
+//! [`Record`] returned by the API is stored as a JSON string.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -9,7 +9,7 @@ use std::path::Path;
 use duckdb::{params, Connection};
 
 use crate::error::GeneBearError;
-use crate::models::AnnotatedVariant;
+use crate::models::Record;
 
 /// DuckDB cache.
 pub struct Cache {
@@ -31,27 +31,8 @@ impl Cache {
         Ok(Cache { conn })
     }
 
-    /// Look up a single key.  Returns `None` on a cache miss.
-    pub fn get(&self, key: &str) -> Result<Option<AnnotatedVariant>, GeneBearError> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT payload FROM variant_cache WHERE cache_key = ?")?;
-
-        let mut rows = stmt.query(params![key])?;
-        if let Some(row) = rows.next()? {
-            let json: String = row.get(0)?;
-            let v: AnnotatedVariant = serde_json::from_str(&json)?;
-            return Ok(Some(v));
-        }
-        Ok(None)
-    }
-
-    /// Bulk cache lookup.  Returns a map of `cache_key → AnnotatedVariant`
-    /// for every key that was found.
-    pub fn get_batch(
-        &self,
-        keys: &[&str],
-    ) -> Result<HashMap<String, AnnotatedVariant>, GeneBearError> {
+    /// Look up several keys. Returns the records of the keys that were found.
+    pub fn get_batch(&self, keys: &[&str]) -> Result<HashMap<String, Record>, GeneBearError> {
         if keys.is_empty() {
             return Ok(HashMap::new());
         }
@@ -74,25 +55,15 @@ impl Cache {
         while let Some(row) = rows.next()? {
             let key: String = row.get(0)?;
             let json: String = row.get(1)?;
-            if let Ok(v) = serde_json::from_str::<AnnotatedVariant>(&json) {
+            if let Ok(v) = serde_json::from_str::<Record>(&json) {
                 map.insert(key, v);
             }
         }
         Ok(map)
     }
 
-    /// Store a single annotation.  Overwrites any existing entry for the same key.
-    pub fn store(&self, key: &str, variant: &AnnotatedVariant) -> Result<(), GeneBearError> {
-        let json = serde_json::to_string(variant)?;
-        self.conn.execute(
-            "INSERT OR REPLACE INTO variant_cache (cache_key, payload) VALUES (?, ?)",
-            params![key, json],
-        )?;
-        Ok(())
-    }
-
     /// Atomically store multiple annotations in a single transaction.
-    pub fn store_batch(&self, entries: &[(&str, &AnnotatedVariant)]) -> Result<(), GeneBearError> {
+    pub fn store_batch(&self, entries: &[(&str, &Record)]) -> Result<(), GeneBearError> {
         if entries.is_empty() {
             return Ok(());
         }
@@ -104,8 +75,8 @@ impl Cache {
                 "INSERT OR REPLACE INTO variant_cache (cache_key, payload) VALUES (?, ?)",
             )?;
 
-            for (key, variant) in entries {
-                let json = serde_json::to_string(variant)?;
+            for (key, record) in entries {
+                let json = serde_json::to_string(record)?;
                 stmt.execute(params![key, json])?;
             }
         }
@@ -132,7 +103,6 @@ impl Cache {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::AnnotatedVariant;
     use tempfile::tempdir;
 
     fn temp_cache() -> (Cache, tempfile::TempDir) {
@@ -142,63 +112,25 @@ mod tests {
         (c, dir)
     }
 
-    fn make_variant(gene: &str, score: f64) -> AnnotatedVariant {
-        AnnotatedVariant {
-            chr: Some("22".into()),
-            pos: Some(1_000),
-            ref_allele: Some("A".into()),
-            alt: Some("T".into()),
-            warning: None,
-            gene_symbol: Some(gene.into()),
-            revel_score: Some(score),
-            effect: None,
-            transcript: None,
-            gene_hgnc_id: None,
-            dbsnp: None,
-            frequency_reference_population: None,
-            hom_count_reference_population: None,
-            allele_count_reference_population: None,
-            gnomad_exomes_af: None,
-            gnomad_genomes_af: None,
-            gnomad_exomes_ac: None,
-            gnomad_genomes_ac: None,
-            gnomad_exomes_homalt: None,
-            gnomad_genomes_homalt: None,
-            gnomad_mito_homoplasmic: None,
-            gnomad_mito_heteroplasmic: None,
-            computational_score_selected: None,
-            computational_prediction_selected: None,
-            computational_source_selected: None,
-            revel_prediction: None,
-            alphamissense_score: None,
-            alphamissense_prediction: None,
-            bayesdelnoaf_score: None,
-            bayesdelnoaf_prediction: None,
-            phylop100way_score: None,
-            phylop100way_prediction: None,
-            splice_score_selected: None,
-            splice_prediction_selected: None,
-            splice_source_selected: None,
-            spliceai_max_score: None,
-            spliceai_max_prediction: None,
-            dbscsnv_ada_score: None,
-            dbscsnv_ada_prediction: None,
-            apogee2_score: None,
-            apogee2_prediction: None,
-            mitotip_score: None,
-            mitotip_prediction: None,
-            acmg_score: None,
-            acmg_classification: None,
-            acmg_criteria: None,
-            acmg_by_gene: None,
-            clinvar_disease: None,
-            clinvar_classification: None,
-            clinvar_review_status: None,
-            clinvar_submissions_summary: None,
-            phenotype_combined: None,
-            pathogenicity_classification_combined: None,
-            consequences: None,
-        }
+    fn get(cache: &Cache, key: &str) -> Option<Record> {
+        cache.get_batch(&[key]).unwrap().remove(key)
+    }
+
+    fn store(cache: &Cache, key: &str, record: &Record) {
+        cache.store_batch(&[(key, record)]).unwrap();
+    }
+
+    fn make_record(gene: &str, score: f64) -> Record {
+        let json = serde_json::json!({
+            "chr": "22",
+            "pos": 1_000,
+            "ref": "A",
+            "alt": "T",
+            "gene_symbol": gene,
+            "revel_score": score,
+            "acmg_score": null,
+        });
+        json.as_object().unwrap().clone()
     }
 
     #[test]
@@ -210,8 +142,7 @@ mod tests {
     #[test]
     fn clear_empties_cache() {
         let (cache, _f) = temp_cache();
-        let v = make_variant("BRCA1", 0.9);
-        cache.store("key1", &v).unwrap();
+        store(&cache, "key1", &make_record("BRCA1", 0.9));
         assert_eq!(cache.count().unwrap(), 1);
         cache.clear().unwrap();
         assert_eq!(cache.count().unwrap(), 0);
@@ -220,72 +151,64 @@ mod tests {
     #[test]
     fn store_and_get_round_trip() {
         let (cache, _f) = temp_cache();
-        let v = make_variant("BRCA2", 0.75);
-        cache.store("k1", &v).unwrap();
+        let record = make_record("BRCA2", 0.75);
+        store(&cache, "k1", &record);
 
-        let hit = cache.get("k1").unwrap().expect("expected cache hit");
-        assert_eq!(hit.gene_symbol.as_deref(), Some("BRCA2"));
-        assert!((hit.revel_score.unwrap() - 0.75).abs() < f64::EPSILON);
+        let hit = get(&cache, "k1").expect("expected cache hit");
+        assert_eq!(hit, record);
     }
 
     #[test]
     fn get_miss_returns_none() {
         let (cache, _f) = temp_cache();
-        assert!(cache.get("nonexistent_key").unwrap().is_none());
+        assert!(get(&cache, "nonexistent_key").is_none());
     }
 
     #[test]
     fn store_overwrites_existing_key() {
         let (cache, _f) = temp_cache();
-        let v1 = make_variant("GENE_A", 0.1);
-        let v2 = make_variant("GENE_B", 0.9);
+        store(&cache, "key", &make_record("GENE_A", 0.1));
+        store(&cache, "key", &make_record("GENE_B", 0.9));
 
-        cache.store("key", &v1).unwrap();
-        cache.store("key", &v2).unwrap(); // same key → overwrite
-
-        let hit = cache.get("key").unwrap().unwrap();
-        assert_eq!(hit.gene_symbol.as_deref(), Some("GENE_B"));
-        assert_eq!(cache.count().unwrap(), 1); // still only one row
+        let hit = get(&cache, "key").unwrap();
+        assert_eq!(hit["gene_symbol"], "GENE_B");
+        assert_eq!(cache.count().unwrap(), 1);
     }
 
     #[test]
     fn store_batch_and_get_batch() {
         let (cache, _f) = temp_cache();
-
-        let v1 = make_variant("GENE1", 0.1);
-        let v2 = make_variant("GENE2", 0.2);
-        let v3 = make_variant("GENE3", 0.3);
+        let (r1, r2, r3) = (
+            make_record("GENE1", 0.1),
+            make_record("GENE2", 0.2),
+            make_record("GENE3", 0.3),
+        );
 
         cache
-            .store_batch(&[("k1", &v1), ("k2", &v2), ("k3", &v3)])
+            .store_batch(&[("k1", &r1), ("k2", &r2), ("k3", &r3)])
             .unwrap();
 
         assert_eq!(cache.count().unwrap(), 3);
-
         let map = cache.get_batch(&["k1", "k2", "k3"]).unwrap();
         assert_eq!(map.len(), 3);
-        assert_eq!(map["k1"].gene_symbol.as_deref(), Some("GENE1"));
-        assert_eq!(map["k2"].gene_symbol.as_deref(), Some("GENE2"));
-        assert_eq!(map["k3"].gene_symbol.as_deref(), Some("GENE3"));
+        assert_eq!(map["k1"], r1);
+        assert_eq!(map["k3"], r3);
     }
 
     #[test]
     fn get_batch_partial_hit() {
         let (cache, _f) = temp_cache();
-        let v = make_variant("PRESENT", 0.5);
-        cache.store("present_key", &v).unwrap();
+        store(&cache, "present_key", &make_record("PRESENT", 0.5));
 
         let map = cache.get_batch(&["present_key", "missing_key"]).unwrap();
         assert_eq!(map.len(), 1);
         assert!(map.contains_key("present_key"));
-        assert!(!map.contains_key("missing_key"));
     }
 
     #[test]
     fn get_batch_empty_input_returns_empty_map() {
         let (cache, _f) = temp_cache();
-        let map = cache.get_batch(&[]).unwrap();
-        assert!(map.is_empty());
+        assert!(cache.get_batch(&[]).unwrap().is_empty());
     }
 
     #[test]
@@ -298,14 +221,32 @@ mod tests {
     #[test]
     fn store_batch_overwrites_existing_keys() {
         let (cache, _f) = temp_cache();
-        let old = make_variant("OLD", 0.1);
-        let new = make_variant("NEW", 0.9);
+        store(&cache, "k", &make_record("OLD", 0.1));
+        cache
+            .store_batch(&[("k", &make_record("NEW", 0.9))])
+            .unwrap();
 
-        cache.store("k", &old).unwrap();
-        cache.store_batch(&[("k", &new)]).unwrap();
-
-        let hit = cache.get("k").unwrap().unwrap();
-        assert_eq!(hit.gene_symbol.as_deref(), Some("NEW"));
+        let hit = get(&cache, "k").unwrap();
+        assert_eq!(hit["gene_symbol"], "NEW");
         assert_eq!(cache.count().unwrap(), 1);
+    }
+
+    #[test]
+    fn reads_records_cached_by_earlier_versions() {
+        let (cache, _f) = temp_cache();
+        let old = crate::models::AnnotatedVariant {
+            revel_score: Some(0.5),
+            ..Default::default()
+        };
+        cache
+            .conn
+            .execute(
+                "INSERT INTO variant_cache (cache_key, payload) VALUES (?, ?)",
+                params!["k", serde_json::to_string(&old).unwrap()],
+            )
+            .unwrap();
+
+        let hit = get(&cache, "k").unwrap();
+        assert_eq!(hit["revel_score"], 0.5);
     }
 }
