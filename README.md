@@ -117,14 +117,17 @@ GeneBe annotations as parquet files. Downloads need a GeneBe account and API
 key and are verified against their checksums:
 
 ```rust
-use genebears::{DatabaseId, Store};
+use genebears::{DatabaseId, Field, Genome, Store};
 
 let hub = client.hub();
 let store = Store::new(Store::default_root().unwrap());
-for id in ["@genebe/revel", "@genebe/alpha_missense", "@genebe/spliceai"] {
-    // Downloads the newest version unless it is installed already.
-    hub.pull(&id.parse::<DatabaseId>()?, &store).await?;
-}
+
+// The databases of all API fields the Hub can provide (see the table above), or of any
+// other fields. Installed versions are not downloaded again.
+hub.pull_for(&Field::hub_backed(Genome::Hg38), Genome::Hg38, &store).await?;
+
+// A single database, the newest version unless the id has one.
+hub.pull(&"@genebe/cadd_hg38".parse::<DatabaseId>()?, &store).await?;
 ```
 
 Databases are stored in the same directory and layout as the

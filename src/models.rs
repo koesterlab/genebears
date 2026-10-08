@@ -230,9 +230,49 @@ pub enum Field {
     Hub { database: String, column: String },
 }
 
+/// API fields that GeneBe takes from columns of hg38 Hub databases, so that installed
+/// databases can serve them. There are none for hg19, since the API lifts hg19 variants over
+/// to hg38 and thus differs from e.g. `@genebe/revel_hg19`.
+pub(crate) const HUB_SOURCES: [(&str, &str, &str); 9] = [
+    ("revel_score", "@genebe/revel", "score"),
+    (
+        "alphamissense_score",
+        "@genebe/alpha_missense",
+        "am_pathogenicity",
+    ),
+    ("spliceai_max_score", "@genebe/spliceai", "max"),
+    ("gnomad_exomes_af", "@genebe/gnomad_exomes4", "AF"),
+    ("gnomad_exomes_ac", "@genebe/gnomad_exomes4", "AC"),
+    ("gnomad_exomes_homalt", "@genebe/gnomad_exomes4", "nhomalt"),
+    ("gnomad_genomes_af", "@genebe/gnomad_genomes4", "AF"),
+    ("gnomad_genomes_ac", "@genebe/gnomad_genomes4", "AC"),
+    (
+        "gnomad_genomes_homalt",
+        "@genebe/gnomad_genomes4",
+        "nhomalt",
+    ),
+];
+
+/// The Hub database and column the API takes a field from.
+pub(crate) fn hub_source(field: &str, genome: Genome) -> Option<(&'static str, &'static str)> {
+    HUB_SOURCES
+        .iter()
+        .find(|(name, ..)| *name == field && genome == Genome::Hg38)
+        .map(|(_, database, column)| (*database, *column))
+}
+
 impl Field {
     pub fn api(name: impl Into<String>) -> Self {
         Field::Api(name.into())
+    }
+
+    /// API fields that installed Hub databases provide instead of the API.
+    pub fn hub_backed(genome: Genome) -> Vec<Field> {
+        HUB_SOURCES
+            .iter()
+            .filter(|(name, ..)| hub_source(name, genome).is_some())
+            .map(|(name, ..)| Field::api(*name))
+            .collect()
     }
 
     pub fn hub(database: impl Into<String>, column: impl Into<String>) -> Self {
@@ -504,6 +544,15 @@ mod tests {
             a.cache_key(Genome::Hg38, opts),
             b.cache_key(Genome::Hg38, opts)
         );
+    }
+
+    #[test]
+    fn hub_backed_fields_are_for_hg38() {
+        let fields = Field::hub_backed(Genome::Hg38);
+        assert_eq!(fields.len(), 9);
+        assert!(fields.contains(&Field::api("revel_score")));
+        assert!(!fields.contains(&Field::api("acmg_score")));
+        assert!(Field::hub_backed(Genome::Hg19).is_empty());
     }
 
     #[test]

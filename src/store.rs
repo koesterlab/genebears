@@ -11,30 +11,7 @@ use tracing::warn;
 
 use crate::error::GeneBearError;
 use crate::hub::{Database, DatabaseId};
-use crate::models::{Field, Genome, Spdi};
-
-/// API fields that GeneBe takes from columns of hg38 Hub databases, so that installed
-/// databases can serve them. There are none for hg19, since the API lifts hg19 variants over
-/// to hg38 and thus differs from e.g. `@genebe/revel_hg19`.
-const API_FIELDS: [(&str, &str, &str); 9] = [
-    ("revel_score", "@genebe/revel", "score"),
-    (
-        "alphamissense_score",
-        "@genebe/alpha_missense",
-        "am_pathogenicity",
-    ),
-    ("spliceai_max_score", "@genebe/spliceai", "max"),
-    ("gnomad_exomes_af", "@genebe/gnomad_exomes4", "AF"),
-    ("gnomad_exomes_ac", "@genebe/gnomad_exomes4", "AC"),
-    ("gnomad_exomes_homalt", "@genebe/gnomad_exomes4", "nhomalt"),
-    ("gnomad_genomes_af", "@genebe/gnomad_genomes4", "AF"),
-    ("gnomad_genomes_ac", "@genebe/gnomad_genomes4", "AC"),
-    (
-        "gnomad_genomes_homalt",
-        "@genebe/gnomad_genomes4",
-        "nhomalt",
-    ),
-];
+use crate::models::{hub_source, Field, Genome, Spdi};
 
 /// A database installed in a [`Store`].
 #[derive(Debug, Clone)]
@@ -135,13 +112,9 @@ impl Store {
         field: &str,
         genome: Genome,
     ) -> Result<Option<(Installed, &'static str)>, GeneBearError> {
-        let Some((_, database, column)) = API_FIELDS.iter().find(|(name, ..)| *name == field)
-        else {
+        let Some((database, column)) = hub_source(field, genome) else {
             return Ok(None);
         };
-        if genome != Genome::Hg38 {
-            return Ok(None);
-        }
         let Some(installed) = self.find(&database.parse()?)? else {
             return Ok(None);
         };
@@ -685,7 +658,7 @@ pub(crate) mod tests {
         let hub = crate::GeneBears::new(crate::ClientConfig::default())
             .unwrap()
             .hub();
-        for (_, database, column) in API_FIELDS {
+        for (_, database, column) in crate::models::HUB_SOURCES {
             let database = hub.database(&database.parse().unwrap()).await.unwrap();
             assert!(
                 database.columns.iter().any(|c| c.name == column),

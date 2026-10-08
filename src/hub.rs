@@ -17,6 +17,7 @@ use xxhash_rust::xxh32::Xxh32;
 
 use crate::client::check;
 use crate::error::GeneBearError;
+use crate::models::{hub_source, Field, Genome};
 use crate::store::{Installed, Store};
 
 const ATTEMPTS: usize = 3;
@@ -321,6 +322,34 @@ impl Hub {
             Some((email, api_key)) => request.basic_auth(email, Some(api_key)),
             None => request,
         }
+    }
+
+    /// Download the databases the fields are read from: those of Hub columns and those GeneBe
+    /// takes API fields from (see [`Field::hub_backed`]).
+    pub async fn pull_for(
+        &self,
+        fields: &[Field],
+        genome: Genome,
+        store: &Store,
+    ) -> Result<Vec<Installed>, GeneBearError> {
+        let mut ids: Vec<DatabaseId> = Vec::new();
+        for field in fields {
+            let id: DatabaseId = match field {
+                Field::Hub { database, .. } => database.parse()?,
+                Field::Api(name) => match hub_source(name, genome) {
+                    Some((database, _)) => database.parse()?,
+                    None => continue,
+                },
+            };
+            if !ids.contains(&id) {
+                ids.push(id);
+            }
+        }
+        let mut installed = Vec::new();
+        for id in &ids {
+            installed.push(self.pull(id, store).await?);
+        }
+        Ok(installed)
     }
 
     async fn download(&self, id: &DatabaseId) -> Result<Download, GeneBearError> {
@@ -723,6 +752,27 @@ mod tests {
         assert_eq!(description, installed.database);
         assert!(!dir.path().join("__temp/genebears/@genebe/revel").exists());
         assert_eq!(store.installed().unwrap().len(), 1);
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn pull_for_downloads_databases_of_fields() {
+        let server = MockServer::start().await;
+        serve(&server, "0.0.1", 1).await;
+        let dir = TempDir::new().unwrap();
+        let fields = [
+            Field::api("revel_score"),
+            Field::api("acmg_score"),
+            Field::hub("@genebe/revel", "score"),
+        ];
+
+        let installed = hub(&server)
+            .pull_for(&fields, Genome::Hg38, &Store::new(dir.path()))
+            .await
+            .unwrap();
+
+        assert_eq!(installed.len(), 1);
+        assert_eq!(installed[0].database.name, "revel");
         server.verify().await;
     }
 
