@@ -195,7 +195,7 @@ impl GeneBears {
                 .map(|(_, name)| name.as_str())
                 .collect();
             let selected: Vec<&Variant> = asked.iter().map(|&i| &variants[i]).collect();
-            let records = self.records(&selected, genome, opts, &names).await?;
+            let records = self.records(&selected, genome, opts, Some(&names)).await?;
             for (&variant, record) in asked.iter().zip(records) {
                 let copied = if keys[variant].is_none() {
                     &sources.copied[..]
@@ -232,7 +232,7 @@ impl GeneBears {
         opts: AnnotateOptions,
     ) -> Result<Vec<AnnotatedVariant>, GeneBearError> {
         let variants: Vec<&Variant> = variants.iter().collect();
-        self.records(&variants, genome, opts, &[])
+        self.records(&variants, genome, opts, None)
             .await?
             .into_iter()
             .map(|record| Ok(serde_json::from_value(Value::Object(record))?))
@@ -280,17 +280,25 @@ impl GeneBears {
         Ok(sources)
     }
 
-    /// API records of the variants, from the cache or, for the others, from the API. Fails if
-    /// the API does not know one of `names`.
+    /// API records of the variants, from the cache or, for the others, from the API. With
+    /// `names`, records keep only these fields and the warning, since complete records of many
+    /// variants take a lot of memory. Fails if the API does not know one of `names`.
     async fn records(
         &self,
         variants: &[&Variant],
         genome: Genome,
         opts: AnnotateOptions,
-        names: &[&str],
+        names: Option<&[&str]>,
     ) -> Result<Vec<Record>, GeneBearError> {
         let keys: Vec<String> = variants.iter().map(|v| v.cache_key(genome, opts)).collect();
         let mut records: Vec<Option<Record>> = vec![None; variants.len()];
+        let reduce = |mut record: Record| {
+            if let Some(names) = names {
+                record.retain(|key, _| key == "warning" || names.contains(&key.as_str()));
+            }
+            record
+        };
+        let names = names.unwrap_or_default();
 
         if let Some(cache) = &self.cache {
             for (records, keys) in records.chunks_mut(MAX_BATCH).zip(keys.chunks(MAX_BATCH)) {
@@ -302,7 +310,8 @@ impl GeneBears {
                     *record = cached
                         .get(key)
                         .filter(|record| names.iter().all(|name| record.contains_key(*name)))
-                        .cloned();
+                        .cloned()
+                        .map(reduce);
                 }
             }
         }
@@ -336,7 +345,7 @@ impl GeneBears {
                 }
             }
             for (&i, record) in batch.iter().zip(fetched) {
-                records[i] = Some(record);
+                records[i] = Some(reduce(record));
             }
         }
         Ok(records.into_iter().flatten().collect())
@@ -578,6 +587,46 @@ mod tests {
             annotations[0].warnings,
             [Warning::Api("Reference allele does not match".into())]
         );
+    }
+
+    #[tokio::test]
+    async fn records_keep_only_the_requested_fields() {
+        let server = api(record(), 1).await;
+        let client = client(&server, ClientConfig::default());
+
+        let records = client
+            .records(
+                &[&snv()],
+                Genome::Hg38,
+                AnnotateOptions::default(),
+                Some(&["revel_score"]),
+            )
+            .await
+            .unwrap();
+
+        let names: Vec<&str> = records[0].keys().map(String::as_str).collect();
+        assert_eq!(names, ["revel_score", "warning"]);
+    }
+
+    #[tokio::test]
+    async fn annotate_variants_caches_complete_records() {
+        let server = api(record(), 1).await;
+        let dir = TempDir::new().unwrap();
+        let client = client(
+            &server,
+            ClientConfig::default().with_cache(dir.path().join("cache.duckdb")),
+        );
+
+        annotate(&client, &[snv()], &[Field::api("revel_score")])
+            .await
+            .unwrap();
+        let annotated = client
+            .annotate_api(&[snv()], Genome::Hg38, AnnotateOptions::default())
+            .await
+            .unwrap();
+
+        assert_eq!(annotated[0].gene_symbol.as_deref(), Some("BRCA1"));
+        server.verify().await;
     }
 
     #[tokio::test]
