@@ -1,5 +1,16 @@
 # Changelog
 
+## [1.0.0](https://github.com/koesterlab/genebears/compare/v0.3.0...v1.0.0) (2026-10-13)
+
+
+### ⚠ BREAKING CHANGES
+
+* Annotate into any type and download GeneBe Hub databases ([#13](https://github.com/koesterlab/genebears/issues/13))
+
+### Features
+
+* Annotate into any type and download GeneBe Hub databases ([#13](https://github.com/koesterlab/genebears/issues/13)) ([444ae91](https://github.com/koesterlab/genebears/commit/444ae9104ec9d5d67e3c5d03a2fb15de88f699e5))
+
 ## [0.3.0](https://github.com/koesterlab/genebears/compare/v0.2.2...v0.3.0) (2026-09-28)
 
 
