@@ -22,9 +22,8 @@ thiserror = "2"
 duckdb = { version = "1.10500", features = ["bundled", "parquet"] }
 tracing = "0.1"
 clap = { version = "4", features = ["derive"] }
-toml = { version = "1", features = ["serde"] }
+toml = "1"
 xxhash-rust = { version = "0.8", features = ["xxh32"] }
-semver = "1"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "macros"] }

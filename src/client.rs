@@ -8,11 +8,10 @@ use tracing::{debug, info, warn};
 
 use crate::cache::Cache;
 use crate::error::GeneBearError;
-use crate::hub::Hub;
 use crate::models::{AnnotateOptions, ApiResponse, Genome, Record, Variant};
 use crate::rate_limiter::RateLimiter;
 
-const BASE_URL: &str = "https://api.genebe.net/cloud/api-public/v1";
+pub(crate) const BASE_URL: &str = "https://api.genebe.net/cloud/api-public/v1";
 /// Maximum number of variants the API accepts per request.
 const MAX_BATCH: usize = 1_000;
 
@@ -171,17 +170,6 @@ impl GeneBears {
         genome: Genome,
         opts: AnnotateOptions,
     ) -> Result<Vec<Record>, GeneBearError> {
-        let body: Vec<Value> = variants
-            .iter()
-            .map(|v| {
-                serde_json::json!({
-                    "chr": v.chr,
-                    "pos": v.pos,
-                    "ref": v.ref_allele,
-                    "alt": v.alt_allele,
-                })
-            })
-            .collect();
         let mut query = vec![("genome", genome.as_str())];
         query.extend(opts.params());
 
@@ -191,7 +179,7 @@ impl GeneBears {
         if let (Some(email), Some(key)) = (&self.email, &self.api_key) {
             req = req.basic_auth(email, Some(key));
         }
-        let resp = check(req.query(&query).json(&body).send().await?).await?;
+        let resp = check(req.query(&query).json(variants).send().await?).await?;
 
         let fetched = resp.json::<ApiResponse>().await?.variants;
         if fetched.len() != variants.len() {
@@ -215,15 +203,6 @@ impl GeneBears {
             cache.clear()?;
         }
         Ok(())
-    }
-
-    /// Access the GeneBe Hub with the credentials and base URL of this client.
-    pub fn hub(&self) -> Hub {
-        Hub {
-            http: self.http.clone(),
-            base_url: self.base_url.clone(),
-            credentials: self.email.clone().zip(self.api_key.clone()),
-        }
     }
 }
 

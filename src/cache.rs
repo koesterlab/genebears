@@ -21,8 +21,10 @@ impl Cache {
     /// table exists.
     pub fn open(path: &Path) -> Result<Self, GeneBearError> {
         let conn = Connection::open(path)?;
+        // Up to version 0.3 the cache held annotated variants, which lack fields of the records.
         conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS variant_cache (
+            "DROP TABLE IF EXISTS variant_cache;
+            CREATE TABLE IF NOT EXISTS records (
                 cache_key   VARCHAR PRIMARY KEY,
                 payload     VARCHAR  NOT NULL,
                 inserted_at TIMESTAMP DEFAULT current_timestamp
@@ -40,7 +42,7 @@ impl Cache {
         let placeholders = keys.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
         let sql = format!(
             "SELECT cache_key, payload \
-             FROM variant_cache \
+             FROM records \
              WHERE cache_key IN ({placeholders})"
         );
 
@@ -71,9 +73,8 @@ impl Cache {
         let tx = self.conn.unchecked_transaction()?;
 
         {
-            let mut stmt = tx.prepare(
-                "INSERT OR REPLACE INTO variant_cache (cache_key, payload) VALUES (?, ?)",
-            )?;
+            let mut stmt =
+                tx.prepare("INSERT OR REPLACE INTO records (cache_key, payload) VALUES (?, ?)")?;
 
             for (key, record) in entries {
                 let json = serde_json::to_string(record)?;
@@ -87,7 +88,7 @@ impl Cache {
 
     /// Remove all cached entries.
     pub fn clear(&self) -> Result<(), GeneBearError> {
-        self.conn.execute_batch("DELETE FROM variant_cache;")?;
+        self.conn.execute_batch("DELETE FROM records;")?;
         Ok(())
     }
 
@@ -95,7 +96,7 @@ impl Cache {
     pub fn count(&self) -> Result<u64, GeneBearError> {
         let n: u64 = self
             .conn
-            .query_row("SELECT COUNT(*) FROM variant_cache", [], |row| row.get(0))?;
+            .query_row("SELECT COUNT(*) FROM records", [], |row| row.get(0))?;
         Ok(n)
     }
 }
@@ -229,24 +230,5 @@ mod tests {
         let hit = get(&cache, "k").unwrap();
         assert_eq!(hit["gene_symbol"], "NEW");
         assert_eq!(cache.count().unwrap(), 1);
-    }
-
-    #[test]
-    fn reads_records_cached_by_earlier_versions() {
-        let (cache, _f) = temp_cache();
-        let old = crate::models::AnnotatedVariant {
-            revel_score: Some(0.5),
-            ..Default::default()
-        };
-        cache
-            .conn
-            .execute(
-                "INSERT INTO variant_cache (cache_key, payload) VALUES (?, ?)",
-                params!["k", serde_json::to_string(&old).unwrap()],
-            )
-            .unwrap();
-
-        let hit = get(&cache, "k").unwrap();
-        assert_eq!(hit["revel_score"], 0.5);
     }
 }

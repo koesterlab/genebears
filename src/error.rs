@@ -45,10 +45,6 @@ pub enum GeneBearError {
     /// A file downloaded from the GeneBe Hub does not match its size or checksum.
     #[error("Downloaded file {file} does not match its size or checksum")]
     Checksum { file: String },
-    /// The GeneBe Hub database requires accepting its license, which genebears does not
-    /// support.
-    #[error("{id} requires accepting its license, which is not supported")]
-    LicenseNotAccepted { id: DatabaseId },
     /// Catch-all for miscellaneous errors.
     #[error("{0}")]
     Other(String),

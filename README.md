@@ -96,11 +96,12 @@ account and API key and are verified against their checksums. Databases are
 read locally afterwards, without the API:
 
 ```rust
-use genebears::{DatabaseId, Genome, Store};
+use genebears::{DatabaseId, Genome, Hub, Store};
 
+let hub = Hub::new("you@example.com", "YOUR_API_KEY")?;
 let store = Store::new(Store::default_root().unwrap());
 let cadd: DatabaseId = "@genebe/cadd_hg38".parse()?;
-client.hub().pull(&cadd, &store).await?;
+hub.pull(&cadd, &store).await?;
 
 #[derive(serde::Deserialize)]
 struct Cadd {
@@ -113,11 +114,12 @@ let rows: Vec<Vec<Cadd>> = store.get(&cadd)?.lookup(&variants, Genome::Hg38, &["
 
 The store has the same layout as the one of the
 [GeneBe client](https://github.com/pstawinski/genebe-cli), so both can use the
-same downloads. Without a version in the id, the newest one is used. Pulling a
-new version keeps the old ones, so keep an eye on disk space
-(`@genebe/cadd_hg38` alone has 53 GB).
+same downloads. Without a version in the id, `pull` downloads the newest version
+of the Hub and `get` uses the newest installed one. Pulling a new version keeps
+the old ones, so keep an eye on disk space (`@genebe/cadd_hg38` alone has 53 GB).
 
-Lookups read whole chromosomes, so look up many variants at once. Split
+Lookups read whole chromosomes and block, so look up many variants at once, in
+async code e.g. with `tokio::task::spawn_blocking`. Split
 multiallelic records and left-align indels (e.g. with `bcftools norm`) first,
 since other indels are not found. Reference alleles are not checked against the
 genome.

@@ -37,6 +37,6 @@ pub mod store;
 
 pub use client::{ClientConfig, GeneBears};
 pub use error::GeneBearError;
-pub use hub::{Database, DatabaseId, Hub};
+pub use hub::{DatabaseId, Description, Hub};
 pub use models::{AnnotateOptions, AnnotatedVariant, Genome, Variant};
-pub use store::{Installed, Store};
+pub use store::{Database, Store};

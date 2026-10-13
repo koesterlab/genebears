@@ -10,7 +10,7 @@ use serde::de::DeserializeOwned;
 use serde_json::{Map, Number, Value};
 
 use crate::error::GeneBearError;
-use crate::hub::{Database, DatabaseId};
+use crate::hub::{DatabaseId, Description};
 use crate::models::{Genome, Variant};
 
 /// Directory with GeneBe Hub databases.
@@ -60,45 +60,55 @@ impl Store {
     }
 
     /// The installed database in the version of `id`, or the newest installed version if
-    /// `id` has none. Versions that are not semantic versions count as the oldest.
-    pub fn get(&self, id: &DatabaseId) -> Result<Installed, GeneBearError> {
+    /// `id` has none.
+    pub fn get(&self, id: &DatabaseId) -> Result<Database, GeneBearError> {
+        id.validate()?;
         let not_installed = || GeneBearError::NotInstalled {
             database: id.clone(),
         };
+        let description_file = |version: &str| {
+            self.path(&id.owner, &id.name, version)
+                .join("description.toml")
+        };
         let version = match &id.version {
             Some(version) => version.clone(),
-            None => directories(&self.root.join(&id.owner).join(&id.name))?
+            // Hidden directories are unfinished downloads.
+            None => fs::read_dir(self.root.join(&id.owner).join(&id.name))
                 .into_iter()
-                .max_by_key(|version| (semver::Version::parse(version).ok(), version.clone()))
+                .flatten()
+                .flatten()
+                .filter_map(|entry| entry.file_name().into_string().ok())
+                .filter(|version| !version.starts_with('.') && description_file(version).exists())
+                .max_by_key(|version| (numbers(version), version.clone()))
                 .ok_or_else(not_installed)?,
         };
         let path = self.path(&id.owner, &id.name, &version);
-        let description = path.join("description.toml");
-        if !description.exists() {
+        let file = description_file(&version);
+        if !file.exists() {
             return Err(not_installed());
         }
-        let database = toml::from_str(&fs::read_to_string(&description)?).map_err(|e| {
-            GeneBearError::Other(format!("Cannot read {}: {e}", description.display()))
-        })?;
-        Ok(Installed { path, database })
+        let description = toml::from_str(&fs::read_to_string(&file)?)
+            .map_err(|e| GeneBearError::Other(format!("Cannot read {}: {e}", file.display())))?;
+        Ok(Database { path, description })
     }
 }
 
 /// A database installed in a [`Store`].
 #[derive(Debug, Clone)]
-pub struct Installed {
+pub struct Database {
     pub path: PathBuf,
-    pub database: Database,
+    pub description: Description,
 }
 
-impl Installed {
+impl Database {
     /// Look up the variants, giving the rows of each with the given columns. Usually a variant
     /// has at most one row, but some databases have more, e.g. one per gene. Variants that
     /// cannot be written like the keys of the Hub, e.g. indels that are not left-aligned, have
     /// none.
     ///
-    /// Each row is deserialized from a JSON object with the columns as keys. Reading the
-    /// parquet files blocks, so use e.g. `tokio::task::spawn_blocking` in async code.
+    /// Each row is deserialized from a JSON object with the columns as keys. The rows of a
+    /// variant are in no particular order. Reading the parquet files blocks, so use e.g.
+    /// `tokio::task::spawn_blocking` in async code.
     pub fn lookup<T: DeserializeOwned>(
         &self,
         variants: &[Variant],
@@ -114,7 +124,7 @@ impl Installed {
         // parts of the files that cannot match.
         let mut ranges: BTreeMap<String, (u32, u32)> = BTreeMap::new();
         let mut appender = conn.appender("query")?;
-        for (index, key) in variants.iter().map(Variant::to_spdi).enumerate() {
+        for (index, key) in variants.iter().map(to_spdi).enumerate() {
             if let Some(key) = key {
                 appender.append_row(params![
                     index as u32,
@@ -128,7 +138,6 @@ impl Installed {
             }
         }
         appender.flush()?;
-        drop(appender);
 
         let selected = columns
             .iter()
@@ -137,18 +146,19 @@ impl Installed {
             .join(", ");
         let mut rows: Vec<Vec<T>> = variants.iter().map(|_| Vec::new()).collect();
         for (seq, (start, end)) in ranges {
-            let partition = self.path.join("parquet").join(format!("_seq={seq}"));
+            // Listing the files instead of a glob pattern keeps paths with `[` working.
+            let files = parquet_files(&self.path.join("parquet").join(format!("_seq={seq}")));
             // Partitions without files would make DuckDB fail.
-            if !has_parquet_files(&partition) {
+            if files.is_empty() {
                 continue;
             }
             let sql = format!(
                 "SELECT query.idx, {selected} \
-                 FROM read_parquet({}) t \
+                 FROM read_parquet([{}]) t \
                  JOIN query ON query.seq = ? AND t._pos = query.pos AND t._del = query.del \
                  AND coalesce(t._ins, '') = query.ins \
                  WHERE t._pos BETWEEN ? AND ?",
-                sql_string(&partition.join("*.parquet")),
+                files.join(", "),
             );
             let mut statement = conn.prepare(&sql)?;
             let mut result = statement.query(params![seq, start, end])?;
@@ -166,7 +176,7 @@ impl Installed {
 
     /// Check that the database has variant keys, the columns and a matching genome.
     fn check(&self, genome: Genome, columns: &[&str]) -> Result<(), GeneBearError> {
-        let database = &self.database;
+        let database = &self.description;
         if let Some(kind) = database.kind.as_deref().filter(|kind| *kind != "VARIANT") {
             return Err(GeneBearError::Other(format!(
                 "{} is a {kind} database, only VARIANT databases are supported",
@@ -182,19 +192,18 @@ impl Installed {
                 column: column.to_string(),
             });
         }
-        let expected = match genome {
-            Genome::Hg38 => "GRCh38",
-            Genome::Hg19 => "GRCh37",
-            Genome::T2t => "T2T",
-        };
         // Some databases have other values than genome builds here.
-        if let Some(build @ ("GRCh37" | "GRCh38")) = database.genome.as_deref() {
-            if build != expected {
-                return Err(GeneBearError::GenomeMismatch {
-                    database: database.id(),
-                    genome,
-                });
-            }
+        let build = match database.genome.as_deref() {
+            Some("GRCh38") => Some(Genome::Hg38),
+            Some("GRCh37") => Some(Genome::Hg19),
+            Some(build) if build.starts_with("T2T") => Some(Genome::T2t),
+            _ => None,
+        };
+        if build.is_some_and(|build| build != genome) {
+            return Err(GeneBearError::GenomeMismatch {
+                database: database.id(),
+                genome,
+            });
         }
         Ok(())
     }
@@ -244,29 +253,113 @@ fn sql_string(path: &Path) -> String {
     format!("'{}'", path.to_string_lossy().replace('\'', "''"))
 }
 
-fn has_parquet_files(directory: &Path) -> bool {
-    fs::read_dir(directory).is_ok_and(|entries| {
-        entries
-            .flatten()
-            .any(|entry| entry.path().extension().is_some_and(|ext| ext == "parquet"))
+/// The parquet files in the directory as SQL strings.
+fn parquet_files(directory: &Path) -> Vec<String> {
+    fs::read_dir(directory)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "parquet"))
+        .map(|path| sql_string(&path))
+        .collect()
+}
+
+/// The numbers in a version, e.g. `[0, 0, 2, 1, 7, 0]` for `0.0.2-1.7.0`, which orders
+/// `0.0.10` after `0.0.9` and `0.0.3-20260205170148` after `0.0.3`.
+fn numbers(version: &str) -> Vec<u64> {
+    version
+        .split(|c: char| !c.is_ascii_digit())
+        .filter_map(|part| part.parse().ok())
+        .collect()
+}
+
+/// Convert a variant into the key of GeneBe Hub databases: chromosome without `chr`, 0-based
+/// position, number of deleted bases and inserted bases. Shared bases are trimmed from
+/// the end (keeping one base per allele), the start and the end again, which gives the
+/// keys GeneBe builds from normalized VCF records. Returns `None` for indels that are not
+/// provably left-aligned, non-ACGT alleles and chromosomes other than 1-22, X, Y and M.
+fn to_spdi(variant: &Variant) -> Option<Spdi> {
+    let seq = ["chr", "CHR", "Chr"]
+        .iter()
+        .find_map(|prefix| variant.chr.strip_prefix(prefix))
+        .unwrap_or(&variant.chr);
+    let seq = if seq == "MT" { "M" } else { seq };
+    if !CHROMOSOMES.contains(&seq) {
+        return None;
+    }
+
+    let reference = variant.ref_allele.to_ascii_uppercase();
+    let alternative = variant.alt_allele.to_ascii_uppercase();
+    if !is_dna(&reference) || !is_dna(&alternative) {
+        return None;
+    }
+    let (mut deleted, mut inserted) = (reference.as_str(), alternative.as_str());
+    while deleted.len() > 1
+        && inserted.len() > 1
+        && deleted.as_bytes().last() == inserted.as_bytes().last()
+    {
+        deleted = &deleted[..deleted.len() - 1];
+        inserted = &inserted[..inserted.len() - 1];
+    }
+    let leading = deleted
+        .bytes()
+        .zip(inserted.bytes())
+        .take_while(|(r, a)| r == a)
+        .count();
+    let (deleted, inserted) = (&deleted[leading..], &inserted[leading..]);
+    let trailing = deleted
+        .bytes()
+        .rev()
+        .zip(inserted.bytes().rev())
+        .take_while(|(r, a)| r == a)
+        .count();
+    let deleted = &deleted[..deleted.len() - trailing];
+    let inserted = &inserted[..inserted.len() - trailing];
+    if deleted.is_empty() && inserted.is_empty() {
+        return None;
+    }
+
+    if deleted.is_empty() || inserted.is_empty() {
+        // A pure indel is left-aligned if the base before it differs from its last base.
+        let indel = if deleted.is_empty() {
+            inserted
+        } else {
+            deleted
+        };
+        let before = reference[..leading].bytes().last()?;
+        if indel.bytes().last() == Some(before) {
+            return None;
+        }
+    }
+
+    Some(Spdi {
+        seq: seq.to_string(),
+        pos: u32::try_from(variant.pos.checked_sub(1)? + leading as u64).ok()?,
+        del: deleted.len() as u32,
+        ins: inserted.to_string(),
     })
 }
 
-/// Names of the subdirectories, without hidden ones and the temporary directory of the
-/// GeneBe client.
-fn directories(directory: &Path) -> Result<Vec<String>, GeneBearError> {
-    let Ok(entries) = fs::read_dir(directory) else {
-        return Ok(Vec::new());
-    };
-    let mut names = Vec::new();
-    for entry in entries {
-        let entry = entry?;
-        let name = entry.file_name().to_string_lossy().into_owned();
-        if entry.path().is_dir() && !name.starts_with('.') && name != "__temp" {
-            names.push(name);
-        }
-    }
-    Ok(names)
+const CHROMOSOMES: [&str; 25] = [
+    "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15", "16", "17",
+    "18", "19", "20", "21", "22", "X", "Y", "M",
+];
+
+fn is_dna(allele: &str) -> bool {
+    !allele.is_empty()
+        && allele
+            .bytes()
+            .all(|base| matches!(base, b'A' | b'C' | b'G' | b'T'))
+}
+
+/// A variant in the notation of GeneBe Hub databases.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct Spdi {
+    seq: String,
+    pos: u32,
+    del: u32,
+    ins: String,
 }
 
 #[cfg(test)]
@@ -289,7 +382,7 @@ pub(crate) mod tests {
             sql_string(&path.join("parquet"))
         ))
         .unwrap();
-        let database = Database {
+        let description = Description {
             owner: id.owner.clone(),
             name: id.name.clone(),
             version,
@@ -306,12 +399,12 @@ pub(crate) mod tests {
         };
         fs::write(
             path.join("description.toml"),
-            toml::to_string(&database).unwrap(),
+            toml::to_string(&description).unwrap(),
         )
         .unwrap();
     }
 
-    fn revel(store: &Store) -> Installed {
+    fn revel(store: &Store) -> Database {
         install(
             store,
             "@genebe/revel:0.0.1",
@@ -369,7 +462,7 @@ pub(crate) mod tests {
     #[test]
     fn lookup_keeps_column_types_and_every_row() {
         let dir = TempDir::new().unwrap();
-        let store = Store::new(dir.path().join("Application Support").join("Felix's"));
+        let store = Store::new(dir.path().join("it's [1]"));
         install(
             &store,
             "@genebe/spliceai",
@@ -418,7 +511,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn get_uses_newest_or_given_version() {
+    fn get_uses_newest_installed_or_given_version() {
         let dir = TempDir::new().unwrap();
         let store = Store::new(dir.path());
         for version in ["0.0.2", "0.0.10", "0.0.10-1", "unversioned"] {
@@ -430,15 +523,144 @@ pub(crate) mod tests {
                 "SELECT '1' AS _seq, 1 AS _pos, 1 AS _del, 'A' AS _ins, 0.5 AS score",
             );
         }
-        let version = |id: &str| store.get(&id.parse().unwrap()).map(|i| i.database.version);
+        fs::create_dir_all(store.path("@genebe", "revel", "0.0.11")).unwrap();
+        let version = |id: &str| {
+            store
+                .get(&id.parse().unwrap())
+                .map(|database| database.description.version)
+        };
 
-        assert_eq!(version("@genebe/revel").unwrap(), "0.0.10");
+        assert_eq!(version("@genebe/revel").unwrap(), "0.0.10-1");
         assert_eq!(version("@genebe/revel:0.0.2").unwrap(), "0.0.2");
-        for missing in ["@genebe/revel:0.0.3", "@genebe/spliceai"] {
+        for missing in [
+            "@genebe/revel:0.0.3",
+            "@genebe/revel:0.0.11",
+            "@genebe/spliceai",
+        ] {
             assert!(matches!(
                 version(missing),
                 Err(GeneBearError::NotInstalled { .. })
             ));
         }
+    }
+
+    fn spdi(seq: &str, pos: u32, del: u32, ins: &str) -> Option<Spdi> {
+        Some(Spdi {
+            seq: seq.to_string(),
+            pos,
+            del,
+            ins: ins.to_string(),
+        })
+    }
+
+    #[test]
+    fn to_spdi_matches_genebe_examples() {
+        // Examples from the GeneBe Hub format description.
+        assert_eq!(
+            to_spdi(&Variant::new("chr1", 1000, "AG", "TT")),
+            spdi("1", 999, 2, "TT")
+        );
+        assert_eq!(
+            to_spdi(&Variant::new("1", 12, "A", "C")),
+            spdi("1", 11, 1, "C")
+        );
+    }
+
+    #[test]
+    fn to_spdi_removes_shared_bases_of_indels() {
+        assert_eq!(
+            to_spdi(&Variant::new("2", 200, "ATG", "A")),
+            spdi("2", 200, 2, "")
+        );
+        assert_eq!(
+            to_spdi(&Variant::new("3", 300, "C", "CTAG")),
+            spdi("3", 300, 0, "TAG")
+        );
+    }
+
+    #[test]
+    fn to_spdi_removes_shared_bases_at_the_end() {
+        assert_eq!(
+            to_spdi(&Variant::new("1", 100, "ACG", "ATG")),
+            spdi("1", 100, 1, "T")
+        );
+        assert_eq!(
+            to_spdi(&Variant::new("1", 100, "CAT", "CT")),
+            spdi("1", 100, 1, "")
+        );
+    }
+
+    #[test]
+    fn to_spdi_keeps_complex_changes() {
+        assert_eq!(
+            to_spdi(&Variant::new("X", 400, "GCA", "TTAG")),
+            spdi("X", 399, 3, "TTAG")
+        );
+    }
+
+    #[test]
+    fn to_spdi_accepts_left_aligned_repeats() {
+        assert_eq!(
+            to_spdi(&Variant::new("1", 100, "ATT", "AT")),
+            spdi("1", 100, 1, "")
+        );
+        assert_eq!(
+            to_spdi(&Variant::new("1", 100, "CAGAG", "CAG")),
+            spdi("1", 100, 2, "")
+        );
+        assert_eq!(
+            to_spdi(&Variant::new("1", 100, "CAT", "CAAT")),
+            spdi("1", 100, 0, "A")
+        );
+    }
+
+    #[test]
+    fn to_spdi_rejects_shiftable_indels() {
+        // Deleting or inserting an A next to another A can be shifted to the left.
+        assert_eq!(to_spdi(&Variant::new("1", 100, "AA", "A")), None);
+        assert_eq!(to_spdi(&Variant::new("1", 100, "A", "AA")), None);
+        assert_eq!(to_spdi(&Variant::new("1", 100, "TAT", "TATAT")), None);
+        // Without a shared first base the alignment is unknown.
+        assert_eq!(to_spdi(&Variant::new("1", 100, "AC", "C")), None);
+        // Left-aligned versions of the above.
+        assert_eq!(
+            to_spdi(&Variant::new("1", 100, "CA", "C")),
+            spdi("1", 100, 1, "")
+        );
+        assert_eq!(
+            to_spdi(&Variant::new("1", 100, "C", "CAT")),
+            spdi("1", 100, 0, "AT")
+        );
+    }
+
+    #[test]
+    fn to_spdi_normalizes_chromosome_and_case() {
+        assert_eq!(
+            to_spdi(&Variant::new("chrMT", 10, "a", "g")),
+            spdi("M", 9, 1, "G")
+        );
+        assert_eq!(
+            to_spdi(&Variant::new("MT", 10, "A", "G")),
+            spdi("M", 9, 1, "G")
+        );
+        assert_eq!(
+            to_spdi(&Variant::new("chrM", 10, "A", "G")),
+            spdi("M", 9, 1, "G")
+        );
+    }
+
+    #[test]
+    fn to_spdi_rejects_unsupported_variants() {
+        assert_eq!(to_spdi(&Variant::new("1", 100, "A", "N")), None);
+        assert_eq!(to_spdi(&Variant::new("1", 100, "A", "*")), None);
+        assert_eq!(to_spdi(&Variant::new("1", 100, "A", "<DEL>")), None);
+        assert_eq!(to_spdi(&Variant::new("1", 100, "A", "A")), None);
+        assert_eq!(to_spdi(&Variant::new("1", 0, "A", "G")), None);
+        assert_eq!(
+            to_spdi(&Variant::new("chr1_KI270706v1_random", 100, "A", "G")),
+            None
+        );
+        assert_eq!(to_spdi(&Variant::new("GL000192.1", 100, "A", "G")), None);
+        assert_eq!(to_spdi(&Variant::new("23", 100, "A", "G")), None);
     }
 }

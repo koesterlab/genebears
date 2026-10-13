@@ -9,15 +9,15 @@ use std::path::Path;
 use std::str::FromStr;
 use std::time::Duration;
 
-use reqwest::{Client, RequestBuilder};
+use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use tokio::io::AsyncWriteExt;
 use tracing::{info, warn};
 use xxhash_rust::xxh32::Xxh32;
 
-use crate::client::check;
+use crate::client::{check, BASE_URL};
 use crate::error::GeneBearError;
-use crate::store::{Installed, Store};
+use crate::store::{Database, Store};
 
 const ATTEMPTS: usize = 3;
 
@@ -47,7 +47,7 @@ impl DatabaseId {
 
     /// The parts end up in URLs and paths of the local store, so only a few characters are
     /// allowed.
-    fn validate(&self) -> Result<(), GeneBearError> {
+    pub(crate) fn validate(&self) -> Result<(), GeneBearError> {
         let valid = |part: &str| {
             !part.is_empty()
                 && !part.starts_with('.')
@@ -100,7 +100,7 @@ impl fmt::Display for DatabaseId {
 /// an installed database.
 #[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", default)]
-pub struct Database {
+pub struct Description {
     pub owner: String,
     pub name: String,
     #[serde(deserialize_with = "null_as_default")]
@@ -123,7 +123,7 @@ pub struct Database {
     pub files: Vec<DatabaseFile>,
 }
 
-impl Database {
+impl Description {
     pub fn id(&self) -> DatabaseId {
         DatabaseId::new(&self.owner, &self.name).with_version(&self.version)
     }
@@ -160,78 +160,100 @@ pub struct DatabaseFile {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Download {
-    description: Database,
+    description: Description,
+    /// Download link of each file.
     #[serde(default)]
     files: HashMap<String, String>,
     description_text: Option<String>,
     license_text: Option<String>,
 }
 
-/// Client for the GeneBe Hub, created with [`crate::GeneBears::hub`].
+/// Client for the GeneBe Hub.
 #[derive(Clone)]
 pub struct Hub {
-    pub(crate) http: Client,
-    pub(crate) base_url: String,
-    pub(crate) credentials: Option<(String, String)>,
+    http: Client,
+    base_url: String,
+    email: String,
+    api_key: String,
 }
 
 impl Hub {
+    /// Hub client with the credentials of a GeneBe account, which downloads require.
+    pub fn new(
+        email: impl Into<String>,
+        api_key: impl Into<String>,
+    ) -> Result<Self, GeneBearError> {
+        let http = Client::builder()
+            .connect_timeout(Duration::from_secs(30))
+            // A stalled download would otherwise never end.
+            .read_timeout(Duration::from_secs(60))
+            .build()?;
+        Ok(Hub {
+            http,
+            base_url: BASE_URL.to_string(),
+            email: email.into(),
+            api_key: api_key.into(),
+        })
+    }
+
     /// Fetch the description of a database version, the newest active one if `id` has
     /// none.
-    pub async fn database(&self, id: &DatabaseId) -> Result<Database, GeneBearError> {
+    pub async fn describe(&self, id: &DatabaseId) -> Result<Description, GeneBearError> {
         id.validate()?;
         let mut url = format!("{}/hub/owner/{}/name/{}", self.base_url, id.owner, id.name);
         if let Some(version) = &id.version {
             url = format!("{url}/version/{version}");
         }
-        let response = self.authorized(self.http.get(&url)).send().await?;
-        Ok(check(response).await?.json().await?)
+        let request = self
+            .http
+            .get(&url)
+            .basic_auth(&self.email, Some(&self.api_key));
+        Ok(check(request.send().await?).await?.json().await?)
     }
 
     /// Download a database version into the store, the newest active one if `id` has none,
-    /// unless it is installed already. Requires credentials.
+    /// unless it is installed already.
     ///
-    /// Files are verified against their checksums. The database only shows up in the store
-    /// once its `description.toml` is written after all files, and a pull that was interrupted
-    /// continues with the files it did not finish.
-    pub async fn pull(&self, id: &DatabaseId, store: &Store) -> Result<Installed, GeneBearError> {
-        if self.credentials.is_none() {
-            return Err(GeneBearError::Other(
-                "Downloading from the GeneBe Hub requires an email and API key".into(),
-            ));
-        }
-        let database = self.database(id).await?;
-        let id = database.id();
+    /// Files are verified against their checksums and downloaded into a hidden directory,
+    /// which is renamed once complete, so unfinished databases never show up in the store.
+    /// An interrupted pull continues with the files it did not finish. Pulls of the same
+    /// database in parallel wait for each other.
+    pub async fn pull(&self, id: &DatabaseId, store: &Store) -> Result<Database, GeneBearError> {
+        let description = self.describe(id).await?;
+        let id = description.id();
         id.validate()?;
-        if let Ok(installed) = store.get(&id) {
+        let version = &description.version;
+        let path = store.path(&id.owner, &id.name, version);
+        let hidden = |suffix: &str| path.with_file_name(format!(".{version}{suffix}"));
+        fs::create_dir_all(path.parent().unwrap())?;
+        let _lock = lock(&hidden(".lock")).await?;
+        if let Ok(database) = store.get(&id) {
             info!("{id} is already installed");
-            return Ok(installed);
+            return Ok(database);
         }
-        if database.status.as_deref() != Some("ACTIVE") {
+        if description.status.as_deref() != Some("ACTIVE") {
             return Err(GeneBearError::Other(format!(
                 "{id} cannot be downloaded, its status is {}",
-                database.status.as_deref().unwrap_or("unknown")
+                description.status.as_deref().unwrap_or("unknown")
             )));
         }
-        if database.license_accept_required {
-            return Err(GeneBearError::LicenseNotAccepted { id });
+        if description.license_accept_required {
+            return Err(GeneBearError::Other(format!(
+                "{id} requires accepting its license, which is not supported"
+            )));
         }
 
-        let mut download = self.download(&id).await?;
-        let path = store.path(&id.owner, &id.name, &database.version);
-        let size: u64 = download
-            .description
-            .files
-            .iter()
-            .filter_map(|f| f.size)
-            .sum();
+        let mut download = self.request_download(&id).await?;
+        let staging = hidden("");
+        let files = &download.description.files;
+        let size: u64 = files.iter().filter_map(|f| f.size).sum();
         info!(
             "Downloading {id} ({} files, {:.1} GB)",
-            download.description.files.len(),
+            files.len(),
             size as f64 / 1e9
         );
-        for file in &download.description.files {
-            let target = path.join(relative_path(&file.file_name)?);
+        for file in files {
+            let target = staging.join(relative_path(&file.file_name)?);
             if file
                 .size
                 .is_some_and(|size| fs::metadata(&target).is_ok_and(|m| m.len() == size))
@@ -242,46 +264,45 @@ impl Hub {
                 .await?;
         }
 
-        fs::create_dir_all(&path)?;
+        fs::create_dir_all(&staging)?;
         fs::write(
-            path.join("README.md"),
+            staging.join("README.md"),
             download.description_text.unwrap_or_default(),
         )?;
         fs::write(
-            path.join("LICENSE.txt"),
+            staging.join("LICENSE.txt"),
             download.license_text.unwrap_or_default(),
         )?;
-        let description = toml::to_string(&download.description)
+        let toml = toml::to_string(&download.description)
             .map_err(|e| GeneBearError::Other(format!("Cannot write description of {id}: {e}")))?;
-        fs::write(path.join("description.toml"), description)?;
+        fs::write(staging.join("description.toml"), toml)?;
+        fs::rename(&staging, &path)?;
         info!("Installed {id} at {}", path.display());
-        Ok(Installed {
+        Ok(Database {
             path,
-            database: download.description,
+            description: download.description,
         })
     }
 
-    fn authorized(&self, request: RequestBuilder) -> RequestBuilder {
-        match &self.credentials {
-            Some((email, api_key)) => request.basic_auth(email, Some(api_key)),
-            None => request,
-        }
-    }
-
-    async fn download(&self, id: &DatabaseId) -> Result<Download, GeneBearError> {
+    async fn request_download(&self, id: &DatabaseId) -> Result<Download, GeneBearError> {
         let body = serde_json::json!({
             "owner": id.owner,
             "name": id.name,
             "version": id.version,
             "format": "parquet",
         });
-        let request = self.http.post(format!("{}/hub/download", self.base_url));
-        let response = self.authorized(request).json(&body).send().await?;
-        Ok(check(response).await?.json().await?)
+        let request = self
+            .http
+            .post(format!("{}/hub/download", self.base_url))
+            .basic_auth(&self.email, Some(&self.api_key));
+        Ok(check(request.json(&body).send().await?)
+            .await?
+            .json()
+            .await?)
     }
 
-    /// Download a file next to `path` and move it there once size and checksum match.
-    /// Download links expire, so they are renewed once if the storage rejects them.
+    /// Download a file to `path`, renewing the download links once if the storage rejects
+    /// them since they expire.
     async fn download_file(
         &self,
         id: &DatabaseId,
@@ -289,20 +310,26 @@ impl Hub {
         path: &Path,
         links: &mut HashMap<String, String>,
     ) -> Result<(), GeneBearError> {
+        let checksum = u32::from_str_radix(&file.xxh32sum, 16).map_err(|_| {
+            GeneBearError::Other(format!(
+                "GeneBe Hub sent an invalid checksum for {}",
+                file.file_name
+            ))
+        })?;
         let mut renewed = false;
         let mut attempt = 0;
         loop {
             let url = links.get(&file.file_name).ok_or_else(|| {
                 GeneBearError::Other(format!("GeneBe Hub sent no link for {}", file.file_name))
             })?;
-            match fetch(&self.http, url, file, path).await {
+            match download_once(&self.http, url, file, checksum, path).await {
                 Ok(()) => return Ok(()),
-                Err(GeneBearError::ApiClientError { status, .. }) if !renewed => {
+                Err(GeneBearError::Http(e)) if !renewed && is_client_error(&e) => {
                     warn!(
-                        "Download link of {} was rejected ({status}), renewing",
+                        "Download link of {} was rejected, renewing: {e}",
                         file.file_name
                     );
-                    *links = self.download(id).await?.files;
+                    *links = self.request_download(id).await?.files;
                     renewed = true;
                 }
                 Err(e) if attempt + 1 < ATTEMPTS && retryable(&e) => {
@@ -316,29 +343,31 @@ impl Hub {
     }
 }
 
-async fn fetch(
+/// Download a file next to `path` and move it there once size and checksum match.
+async fn download_once(
     http: &Client,
     url: &str,
     file: &DatabaseFile,
+    checksum: u32,
     path: &Path,
 ) -> Result<(), GeneBearError> {
-    // Download links are credentials, so they must not end up in errors and logs.
-    let response = http
+    // Download links are credentials, so they must not end up in errors and logs. Neither
+    // do the error messages of the storage, which contain the signature of the link.
+    let mut response = http
         .get(url)
         .send()
         .await
+        .and_then(reqwest::Response::error_for_status)
         .map_err(reqwest::Error::without_url)?;
-    let mut response = check(response).await?;
     fs::create_dir_all(path.parent().unwrap())?;
     let mut partial = path.as_os_str().to_owned();
     partial.push(".part");
     let mut out = tokio::fs::File::create(&partial).await?;
     let mut hasher = Xxh32::new(0);
     let mut size = 0;
-    // A stalled download would otherwise never end.
-    while let Some(chunk) = tokio::time::timeout(Duration::from_secs(60), response.chunk())
+    while let Some(chunk) = response
+        .chunk()
         .await
-        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "download stalled"))?
         .map_err(reqwest::Error::without_url)?
     {
         hasher.update(&chunk);
@@ -346,8 +375,7 @@ async fn fetch(
         out.write_all(&chunk).await?;
     }
     out.sync_all().await?;
-    let checksum = u32::from_str_radix(&file.xxh32sum, 16).ok();
-    if file.size.is_some_and(|expected| expected != size) || checksum != Some(hasher.digest()) {
+    if file.size.is_some_and(|expected| expected != size) || hasher.digest() != checksum {
         fs::remove_file(&partial)?;
         return Err(GeneBearError::Checksum {
             file: file.file_name.clone(),
@@ -357,12 +385,36 @@ async fn fetch(
     Ok(())
 }
 
+/// Lock the file, waiting while another process holds the lock.
+async fn lock(path: &Path) -> Result<fs::File, GeneBearError> {
+    let file = fs::File::options()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(path)?;
+    match file.try_lock() {
+        Ok(()) => Ok(file),
+        Err(fs::TryLockError::WouldBlock) => {
+            info!("Waiting for another pull to release {}", path.display());
+            let file = tokio::task::spawn_blocking(move || file.lock().map(|()| file))
+                .await
+                .map_err(io::Error::other)??;
+            Ok(file)
+        }
+        Err(fs::TryLockError::Error(e)) => Err(e.into()),
+    }
+}
+
+fn is_client_error(error: &reqwest::Error) -> bool {
+    error
+        .status()
+        .is_some_and(|status| status.is_client_error())
+}
+
 fn retryable(error: &GeneBearError) -> bool {
     match error {
-        GeneBearError::Http(_)
-        | GeneBearError::Checksum { .. }
-        | GeneBearError::ApiServerError { .. } => true,
-        GeneBearError::Io(e) => e.kind() == io::ErrorKind::TimedOut,
+        GeneBearError::Http(e) => !is_client_error(e),
+        GeneBearError::Checksum { .. } => true,
         _ => false,
     }
 }
@@ -388,7 +440,7 @@ mod tests {
     use super::*;
     use serde_json::json;
     use tempfile::TempDir;
-    use wiremock::matchers::{any, method, path};
+    use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
     use xxhash_rust::xxh32::xxh32;
 
@@ -399,9 +451,8 @@ mod tests {
 
     fn hub(server: &MockServer) -> Hub {
         Hub {
-            http: Client::new(),
             base_url: server.uri(),
-            credentials: Some(("me@example.com".into(), "key".into())),
+            ..Hub::new("me@example.com", "key").unwrap()
         }
     }
 
@@ -544,7 +595,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn database_fetches_description() {
+    async fn describe_fetches_description() {
         let server = MockServer::start().await;
         serve_description(&server, "0.0.2").await;
         Mock::given(method("GET"))
@@ -554,8 +605,8 @@ mod tests {
             .await;
         let hub = hub(&server);
 
-        let newest = hub.database(&revel()).await.unwrap();
-        let older = hub.database(&revel().with_version("0.0.1")).await.unwrap();
+        let newest = hub.describe(&revel()).await.unwrap();
+        let older = hub.describe(&revel().with_version("0.0.1")).await.unwrap();
 
         assert_eq!(newest.id(), revel().with_version("0.0.2"));
         assert_eq!(older.id(), revel().with_version("0.0.1"));
@@ -566,16 +617,6 @@ mod tests {
         assert_eq!(newest.files[0].size, Some(5));
     }
 
-    #[test]
-    fn hub_uses_client_credentials() {
-        let config = crate::ClientConfig::with_credentials("me@example.com", "key");
-        let hub = crate::GeneBears::new(config).unwrap().hub();
-        assert_eq!(
-            hub.credentials,
-            Some(("me@example.com".into(), "key".into()))
-        );
-    }
-
     #[tokio::test]
     async fn pull_installs_database() {
         let server = MockServer::start().await;
@@ -583,20 +624,20 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let store = Store::new(dir.path());
 
-        let installed = hub(&server).pull(&revel(), &store).await.unwrap();
+        let database = hub(&server).pull(&revel(), &store).await.unwrap();
 
         let path = dir.path().join("@genebe/revel/0.0.1");
-        assert_eq!(installed.path, path);
-        assert_eq!(installed.database.version, "0.0.1");
+        assert_eq!(database.path, path);
+        assert_eq!(database.description.version, "0.0.1");
         for (name, content) in FILES {
             assert_eq!(fs::read(path.join(name)).unwrap(), content);
         }
         let read = |name| fs::read_to_string(path.join(name)).unwrap();
         assert_eq!(read("README.md"), "## REVEL");
         assert_eq!(read("LICENSE.txt"), "Free for non-commercial use");
-        let description: Database = toml::from_str(&read("description.toml")).unwrap();
-        assert_eq!(description, installed.database);
-        assert_eq!(store.get(&revel()).unwrap().database, installed.database);
+        let description: Description = toml::from_str(&read("description.toml")).unwrap();
+        assert_eq!(description, database.description);
+        assert_eq!(store.get(&revel()).unwrap().description, description);
         server.verify().await;
     }
 
@@ -608,9 +649,23 @@ mod tests {
         let store = Store::new(dir.path());
 
         hub(&server).pull(&revel(), &store).await.unwrap();
-        let installed = hub(&server).pull(&revel(), &store).await.unwrap();
+        let database = hub(&server).pull(&revel(), &store).await.unwrap();
 
-        assert_eq!(installed.database.version, "0.0.1");
+        assert_eq!(database.description.version, "0.0.1");
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn parallel_pulls_download_once() {
+        let server = MockServer::start().await;
+        serve(&server, "0.0.1", 1).await;
+        let dir = TempDir::new().unwrap();
+        let store = Store::new(dir.path());
+        let (hub, id) = (hub(&server), revel());
+
+        let (first, second) = tokio::join!(hub.pull(&id, &store), hub.pull(&id, &store));
+
+        assert_eq!(first.unwrap().path, second.unwrap().path);
         server.verify().await;
     }
 
@@ -622,7 +677,7 @@ mod tests {
         serve_file(&server, "0.0.1", 0, FILES[0].1, 0).await;
         serve_file(&server, "0.0.1", 1, FILES[1].1, 1).await;
         let dir = TempDir::new().unwrap();
-        let finished = dir.path().join("@genebe/revel/0.0.1").join(FILES[0].0);
+        let finished = dir.path().join("@genebe/revel/.0.0.1").join(FILES[0].0);
         fs::create_dir_all(finished.parent().unwrap()).unwrap();
         fs::write(&finished, FILES[0].1).unwrap();
         let store = Store::new(dir.path());
@@ -724,28 +779,7 @@ mod tests {
 
         let result = hub(&server).pull(&revel(), &Store::new(dir.path())).await;
 
-        assert!(matches!(
-            result,
-            Err(GeneBearError::LicenseNotAccepted { .. })
-        ));
-        server.verify().await;
-    }
-
-    #[tokio::test]
-    async fn pull_requires_credentials() {
-        let server = MockServer::start().await;
-        Mock::given(any())
-            .respond_with(ResponseTemplate::new(200))
-            .expect(0)
-            .mount(&server)
-            .await;
-        let hub = Hub {
-            credentials: None,
-            ..hub(&server)
-        };
-        let dir = TempDir::new().unwrap();
-
-        assert!(hub.pull(&revel(), &Store::new(dir.path())).await.is_err());
+        assert!(result.unwrap_err().to_string().contains("license"));
         server.verify().await;
     }
 }
