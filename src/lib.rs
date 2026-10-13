@@ -1,13 +1,12 @@
 //! # genebears
 //!
 //! A lightweight Rust client for the [GeneBe](https://genebe.net/) genetic
-//! variant annotation API. Databases from the [GeneBe Hub](https://genebe.net/hub)
-//! can be downloaded into a local [`Store`] and are then used instead of the API.
+//! variant annotation API and the databases of the [GeneBe Hub](https://genebe.net/hub).
 //!
 //! ## Quick start
 //!
 //! ```rust, no_run
-//! use genebears::{AnnotateOptions, ClientConfig, Field, GeneBears, Genome, Variant};
+//! use genebears::{AnnotateOptions, AnnotatedVariant, ClientConfig, GeneBears, Genome, Variant};
 //!
 //! #[tokio::main]
 //! async fn main() -> Result<(), genebears::GeneBearError> {
@@ -17,16 +16,12 @@
 //!         Variant::new("22", 28_695_868, "AG", "A"),
 //!         Variant::new("6",  160_585_140, "T",  "G"),
 //!     ];
-//!     let revel = Field::api("revel_score");
-//!     let acmg = Field::api("acmg_classification");
-//!     let fields = [revel.clone(), acmg.clone()];
-//!
-//!     let annotations = client
-//!         .annotate_variants(&variants, Genome::Hg38, &fields, AnnotateOptions::default())
+//!     let annotations: Vec<AnnotatedVariant> = client
+//!         .annotate(&variants, Genome::Hg38, AnnotateOptions::default())
 //!         .await?;
 //!
 //!     for annotation in &annotations {
-//!         println!("revel={:?}  acmg={:?}", annotation.f64(&revel), annotation.str(&acmg));
+//!         println!("{:?}  acmg={:?}", annotation.gene_symbol, annotation.acmg_classification);
 //!     }
 //!     Ok(())
 //! }
@@ -43,5 +38,5 @@ pub mod store;
 pub use client::{ClientConfig, GeneBears};
 pub use error::GeneBearError;
 pub use hub::{Database, DatabaseId, Hub};
-pub use models::{AnnotateOptions, AnnotatedVariant, Annotation, Field, Genome, Variant, Warning};
+pub use models::{AnnotateOptions, AnnotatedVariant, Genome, Variant};
 pub use store::{Installed, Store};

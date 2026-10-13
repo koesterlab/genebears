@@ -1,7 +1,7 @@
 use thiserror::Error;
 
 use crate::hub::DatabaseId;
-use crate::models::{Field, Genome};
+use crate::models::Genome;
 
 #[derive(Debug, Error)]
 #[non_exhaustive]
@@ -21,9 +21,12 @@ pub enum GeneBearError {
     /// The GeneBe API failed to process the request (5xx) — e.g. unknown contig.
     #[error("API server error (HTTP {status}): {message}")]
     ApiServerError { status: u16, message: String },
-    /// A requested API field or Hub database column does not exist.
-    #[error("Unknown field {field}")]
-    UnknownField { field: Field },
+    /// A Hub database has no column of the requested name.
+    #[error("{database} has no column {column}")]
+    UnknownColumn {
+        database: DatabaseId,
+        column: String,
+    },
     /// A requested Hub database is not installed.
     #[error("{database} is not installed")]
     NotInstalled { database: DatabaseId },
@@ -45,7 +48,7 @@ pub enum GeneBearError {
     /// The GeneBe Hub database requires accepting its license, which genebears does not
     /// support.
     #[error("{id} requires accepting its license, which is not supported")]
-    LicenseNotAccepted { id: String },
+    LicenseNotAccepted { id: DatabaseId },
     /// Catch-all for miscellaneous errors.
     #[error("{0}")]
     Other(String),

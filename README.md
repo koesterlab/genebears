@@ -4,8 +4,8 @@
 
 A lightweight, async Rust client for the [GeneBe](https://genebe.net/) genetic
 variant annotation API, with a **DuckDB-backed cache** and a **token-bucket
-rate limiter** built in. Databases from the [GeneBe Hub](https://genebe.net/hub)
-can be downloaded and are then used instead of the API.
+rate limiter** built in. It can also download and read databases of the
+[GeneBe Hub](https://genebe.net/hub).
 
 ## Installation
 
@@ -18,85 +18,63 @@ tokio     = { version = "1", features = ["full"] }
 ## Quick start
 
 ```rust
-use genebears::{AnnotateOptions, ClientConfig, Field, GeneBears, Genome, Variant};
+use genebears::{AnnotateOptions, AnnotatedVariant, ClientConfig, GeneBears, Genome, Variant};
 
 #[tokio::main]
 async fn main() -> Result<(), genebears::GeneBearError> {
-    // Unauthenticated, fine for low-volume usage.
+    // Unauthenticated — fine for low-volume usage.
     let client = GeneBears::new(ClientConfig::default())?;
 
     let variants = vec![
         Variant::new("22", 28_695_868, "AG", "A"),
         Variant::new("6",  160_585_140, "T",  "G"),
     ];
-    let revel = Field::api("revel_score");
-    let acmg = Field::api("acmg_classification");
-    let fields = [revel.clone(), acmg.clone()];
 
-    let annotations = client
-        .annotate_variants(&variants, Genome::Hg38, &fields, AnnotateOptions::default())
+    let results: Vec<AnnotatedVariant> = client
+        .annotate(&variants, Genome::Hg38, AnnotateOptions::default())
         .await?;
 
-    for annotation in &annotations {
-        println!("revel={:?}  acmg={:?}", annotation.f64(&revel), annotation.str(&acmg));
+    for v in &results {
+        println!(
+            "gene={:?}  revel={:?}  alphamissense={:?}  acmg={:?}",
+            v.gene_symbol,
+            v.revel_score,
+            v.alphamissense_score,
+            v.acmg_classification,
+        );
     }
     Ok(())
 }
 ```
 
-## Fields
-
-`annotate_variants` returns one `Annotation` per variant, in the order of the
-variants, with a value for each requested field:
-
-* `Field::api(name)` is a field of the API response, named as in GeneBe's JSON,
-  e.g. `acmg_score`, `gnomad_exomes_af` or `consequences`.
-* `Field::hub(database, column)` is a column of a GeneBe Hub database, e.g.
-  `Field::hub("@genebe/cadd_hg38", "phred")`. The database has to be installed
-  (see below).
-
-Fields can also be parsed from strings like `acmg_score` or
-`@genebe/cadd_hg38/phred`. Values are `serde_json::Value`s; `Annotation::f64`
-and `Annotation::str` read numbers and strings. Variants that could not be
-annotated completely, e.g. because the reference allele does not match the
-genome, have `warnings`.
-
-To get everything the API knows about a variant instead, `annotate_api` returns
-its complete record.
-
-## Credentials, cache and Hub databases
+`AnnotatedVariant` holds every field of the API. If you only need a few, any
+type that serde can deserialize from the API's JSON works as well:
 
 ```rust
-use genebears::{ClientConfig, GeneBears, Store};
+#[derive(serde::Deserialize)]
+struct Scores {
+    revel_score: Option<f64>,
+    spliceai_max_score: Option<f64>,
+}
+
+let scores: Vec<Scores> = client.annotate(&variants, Genome::Hg38, AnnotateOptions::default()).await?;
+```
+
+Variants are sent in batches of 1 000, so lists of any length can be passed.
+
+## Credential and cache usage
+
+```rust
+use genebears::{GeneBears, ClientConfig};
 
 let config = ClientConfig::with_credentials("you@example.com", "YOUR_API_KEY")
-    .with_cache("variants.duckdb")
-    .with_store(Store::new(Store::default_root().unwrap()));
+    .with_cache("variants.duckdb");
 
 let client = GeneBears::new(config)?;
 ```
 
-Each field is read from one source:
-
-1. Hub databases in the store. Besides their own columns, these provide the
-   hg38 API fields GeneBe takes from them, with the same values (see below).
-   Options like `omit_basic` do not apply to them.
-2. Otherwise the cache, which holds the API records of variants seen before.
-3. And for variants not in the cache, the API, asked once for all of them.
-
-| Database                  | API fields                                                          |
-|---------------------------|---------------------------------------------------------------------|
-| `@genebe/revel`           | `revel_score`                                                       |
-| `@genebe/alpha_missense`  | `alphamissense_score`                                               |
-| `@genebe/spliceai`        | `spliceai_max_score`                                                |
-| `@genebe/gnomad_exomes4`  | `gnomad_exomes_af`, `gnomad_exomes_ac`, `gnomad_exomes_homalt`      |
-| `@genebe/gnomad_genomes4` | `gnomad_genomes_af`, `gnomad_genomes_ac`, `gnomad_genomes_homalt`   |
-
-If every requested field comes from installed databases, annotating normalized
-variants needs no request to GeneBe. ACMG classifications, consequences and
-other genomes always come from the API, since there are no Hub databases for
-them. For hg19, the API lifts variants over to hg38, which the hg19 databases of
-the Hub do not reproduce.
+On every subsequent run the cache is consulted first; only variants that have
+never been seen before reach the network.
 
 ## Annotation options
 
@@ -112,38 +90,37 @@ let opts = AnnotateOptions {
 
 ## GeneBe Hub
 
-The [GeneBe Hub](https://genebe.net/hub) publishes the databases behind many
-GeneBe annotations as parquet files. Downloads need a GeneBe account and API
-key and are verified against their checksums:
+The [GeneBe Hub](https://genebe.net/hub) publishes annotation databases, e.g.
+CADD, REVEL, SpliceAI or gnomAD, as parquet files. Downloads need a GeneBe
+account and API key and are verified against their checksums. Databases are
+read locally afterwards, without the API:
 
 ```rust
-use genebears::{DatabaseId, Field, Genome, Store};
+use genebears::{DatabaseId, Genome, Store};
 
-let hub = client.hub();
 let store = Store::new(Store::default_root().unwrap());
+let cadd: DatabaseId = "@genebe/cadd_hg38".parse()?;
+client.hub().pull(&cadd, &store).await?;
 
-// The databases of all API fields the Hub can provide (see the table above), or of any
-// other fields. Installed versions are not downloaded again.
-hub.pull_for(&Field::hub_backed(Genome::Hg38), Genome::Hg38, &store).await?;
+#[derive(serde::Deserialize)]
+struct Cadd {
+    phred: f64,
+}
 
-// A single database, the newest version unless the id has one.
-hub.pull(&"@genebe/cadd_hg38".parse::<DatabaseId>()?, &store).await?;
+// Rows per variant: usually none or one, some databases have one per gene.
+let rows: Vec<Vec<Cadd>> = store.get(&cadd)?.lookup(&variants, Genome::Hg38, &["phred"])?;
 ```
 
-Databases are stored in the same directory and layout as the
-[GeneBe client](https://github.com/pstawinski/genebe-cli) uses, so both can use
-the same downloads. The newest installed version of a database is used, unless
-a field names one, e.g. `Field::hub("@genebe/cadd_hg38:0.0.2-1.7.0", "phred")`.
-Pulling a new version keeps the old ones, so keep an eye on disk space
-(`@genebe/gnomad_genomes4` alone has 34 GB).
+The store has the same layout as the one of the
+[GeneBe client](https://github.com/pstawinski/genebe-cli), so both can use the
+same downloads. Without a version in the id, the newest one is used. Pulling a
+new version keeps the old ones, so keep an eye on disk space
+(`@genebe/cadd_hg38` alone has 53 GB).
 
-Split multiallelic records and left-align indels (e.g. with `bcftools norm`)
-before annotating. Variants that cannot be looked up in Hub databases, e.g.
-indels that are not left-aligned, are annotated by the API instead. Hub columns
-stay empty for them, with a `warning`. Reference alleles are not checked against
-the genome. Lookups read whole chromosomes of a database, so annotate many variants
-at once. Do not pull a database while annotating with it.
-
+Lookups read whole chromosomes, so look up many variants at once. Split
+multiallelic records and left-align indels (e.g. with `bcftools norm`) first,
+since other indels are not found. Reference alleles are not checked against the
+genome.
 
 ## Authors
 - Felix Wiegand
