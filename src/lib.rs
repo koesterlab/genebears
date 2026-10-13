@@ -1,12 +1,12 @@
 //! # genebears
 //!
 //! A lightweight Rust client for the [GeneBe](https://genebe.net/) genetic
-//! variant annotation API.
+//! variant annotation API and the databases of the [GeneBe Hub](https://genebe.net/hub).
 //!
 //! ## Quick start
 //!
 //! ```rust, no_run
-//! use genebears::{GeneBears, ClientConfig, Variant, Genome, AnnotateOptions};
+//! use genebears::{AnnotateOptions, AnnotatedVariant, ClientConfig, GeneBears, Genome, Variant};
 //!
 //! #[tokio::main]
 //! async fn main() -> Result<(), genebears::GeneBearError> {
@@ -16,27 +16,27 @@
 //!         Variant::new("22", 28_695_868, "AG", "A"),
 //!         Variant::new("6",  160_585_140, "T",  "G"),
 //!     ];
-//!
-//!     let results = client
-//!         .annotate_variants(&variants, Genome::Hg38, AnnotateOptions::default())
+//!     let annotations: Vec<AnnotatedVariant> = client
+//!         .annotate(&variants, Genome::Hg38, AnnotateOptions::default())
 //!         .await?;
 //!
-//!     for v in &results {
-//!         println!(
-//!             "gene={:?}  revel={:?}  alphamissense={:?}  acmg={:?}",
-//!             v.gene_symbol, v.revel_score, v.alphamissense_score, v.acmg_classification,
-//!         );
+//!     for annotation in &annotations {
+//!         println!("{:?}  acmg={:?}", annotation.gene_symbol, annotation.acmg_classification);
 //!     }
 //!     Ok(())
 //! }
 //! ```
 
-pub mod cache;
+mod cache;
 pub mod client;
 pub mod error;
+pub mod hub;
 pub mod models;
 pub mod rate_limiter;
+pub mod store;
 
 pub use client::{ClientConfig, GeneBears};
 pub use error::GeneBearError;
+pub use hub::{DatabaseId, Description, Hub};
 pub use models::{AnnotateOptions, AnnotatedVariant, Genome, Variant};
+pub use store::{Database, Store};

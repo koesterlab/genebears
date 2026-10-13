@@ -1,5 +1,6 @@
 use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 /// Reference genome assembly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default, ValueEnum)]
@@ -54,15 +55,22 @@ impl Variant {
         }
     }
 
-    pub fn cache_key(&self, genome: Genome) -> String {
-        format!(
+    /// Key of the API record of this variant in the cache. Options are part of the key since
+    /// they change the record.
+    pub(crate) fn cache_key(&self, genome: Genome, opts: AnnotateOptions) -> String {
+        let mut key = format!(
             "{}:{}:{}:{}:{}",
             self.chr,
             self.pos,
             self.ref_allele,
             self.alt_allele,
             genome.as_str()
-        )
+        );
+        for (name, _) in opts.params() {
+            key.push(':');
+            key.push_str(name);
+        }
+        key
     }
 }
 
@@ -70,7 +78,7 @@ impl Variant {
 ///
 /// All fields default to `false` / `None`, which means the API returns
 /// everything.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct AnnotateOptions {
     /// Use only RefSeq transcripts.
     pub use_refseq: Option<bool>,
@@ -88,11 +96,32 @@ pub struct AnnotateOptions {
     pub all_genes: bool,
 }
 
+impl AnnotateOptions {
+    /// Query parameters of the options that are set.
+    pub(crate) fn params(&self) -> Vec<(&'static str, &'static str)> {
+        [
+            ("useRefseq", self.use_refseq == Some(true)),
+            ("useEnsembl", self.use_ensembl == Some(true)),
+            ("omitAcmg", self.omit_acmg),
+            ("omitCsq", self.omit_csq),
+            ("omitBasic", self.omit_basic),
+            ("omitAdvanced", self.omit_advanced),
+            ("allGenes", self.all_genes),
+        ]
+        .into_iter()
+        .filter(|(_, set)| *set)
+        .map(|(name, _)| (name, "true"))
+        .collect()
+    }
+}
+
+/// Annotation of a variant as returned by the GeneBe API, with every API field as key.
+pub(crate) type Record = serde_json::Map<String, Value>;
+
 /// Top-level response envelope returned by the GeneBe API.
 #[derive(Debug, Deserialize)]
 pub(crate) struct ApiResponse {
-    pub variants: Vec<AnnotatedVariant>,
-    pub _message: Option<String>,
+    pub variants: Vec<Record>,
 }
 
 /// Full annotation for one variant, as returned by GeneBe.
@@ -239,26 +268,44 @@ mod tests {
     #[test]
     fn variant_cache_key_format() {
         let v = Variant::new("22", 28_695_868, "AG", "A");
-        let key = v.cache_key(Genome::Hg38);
+        let key = v.cache_key(Genome::Hg38, AnnotateOptions::default());
         assert_eq!(key, "22:28695868:AG:A:hg38");
     }
 
     #[test]
     fn variant_cache_key_differs_by_genome() {
         let v = Variant::new("1", 100, "C", "T");
-        let k38 = v.cache_key(Genome::Hg38);
-        let k19 = v.cache_key(Genome::Hg19);
-        let kt2t = v.cache_key(Genome::T2t);
+        let k38 = v.cache_key(Genome::Hg38, AnnotateOptions::default());
+        let k19 = v.cache_key(Genome::Hg19, AnnotateOptions::default());
+        let kt2t = v.cache_key(Genome::T2t, AnnotateOptions::default());
         assert_ne!(k38, k19);
         assert_ne!(k38, kt2t);
         assert_ne!(k19, kt2t);
     }
 
     #[test]
+    fn variant_cache_key_contains_options() {
+        let v = Variant::new("22", 28_695_868, "AG", "A");
+        let opts = AnnotateOptions {
+            omit_acmg: true,
+            use_refseq: Some(true),
+            ..Default::default()
+        };
+        assert_eq!(
+            v.cache_key(Genome::Hg38, opts),
+            "22:28695868:AG:A:hg38:useRefseq:omitAcmg"
+        );
+    }
+
+    #[test]
     fn variant_cache_key_differs_by_position() {
         let a = Variant::new("1", 100, "C", "T");
         let b = Variant::new("1", 101, "C", "T");
-        assert_ne!(a.cache_key(Genome::Hg38), b.cache_key(Genome::Hg38));
+        let opts = AnnotateOptions::default();
+        assert_ne!(
+            a.cache_key(Genome::Hg38, opts),
+            b.cache_key(Genome::Hg38, opts)
+        );
     }
 
     #[test]

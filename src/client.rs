@@ -1,15 +1,18 @@
 use std::path::PathBuf;
 
 use reqwest::header::{self, HeaderMap, HeaderValue};
-use reqwest::Client;
+use reqwest::{Client, Response};
+use serde::de::DeserializeOwned;
+use serde_json::Value;
 use tracing::{debug, info, warn};
 
 use crate::cache::Cache;
 use crate::error::GeneBearError;
-use crate::models::{AnnotateOptions, AnnotatedVariant, ApiResponse, Genome, Variant};
+use crate::models::{AnnotateOptions, ApiResponse, Genome, Record, Variant};
 use crate::rate_limiter::RateLimiter;
 
-const BASE_URL: &str = "https://api.genebe.net/cloud/api-public/v1";
+pub(crate) const BASE_URL: &str = "https://api.genebe.net/cloud/api-public/v1";
+/// Maximum number of variants the API accepts per request.
 const MAX_BATCH: usize = 1_000;
 
 /// Configuration options for the client
@@ -67,8 +70,7 @@ impl ClientConfig {
 
 /// The main genebears client.
 ///
-/// Construct with [`GeneBears::new`], then call [`GeneBears::annotate_variant`]
-/// or [`GeneBears::annotate_variants`].
+/// Construct with [`GeneBears::new`], then call [`GeneBears::annotate`].
 pub struct GeneBears {
     http: Client,
     cache: Option<Cache>,
@@ -93,193 +95,101 @@ impl GeneBears {
             None
         };
 
-        let rate_limiter = RateLimiter::new(config.rate_per_second, config.burst);
-        let base_url = config
-            .base_url
-            .clone()
-            .unwrap_or_else(|| BASE_URL.to_string());
-
         Ok(GeneBears {
             http,
             cache,
-            rate_limiter,
-            base_url,
+            rate_limiter: RateLimiter::new(config.rate_per_second, config.burst),
+            base_url: config.base_url.unwrap_or_else(|| BASE_URL.to_string()),
             email: config.email,
             api_key: config.api_key,
         })
     }
 
-    /// Annotate a **single** variant.
+    /// Annotate variants from the cache or, for the others, the API. Results are returned in
+    /// the same order as `variants`.
     ///
-    /// Uses the cache on hit; otherwise calls the GeneBe batch endpoint with
-    /// a single-element list
-    pub async fn annotate_variant(
-        &self,
-        variant: &Variant,
-        genome: Genome,
-        opts: AnnotateOptions,
-    ) -> Result<AnnotatedVariant, GeneBearError> {
-        let mut results = self
-            .annotate_variants(std::slice::from_ref(variant), genome, opts)
-            .await?;
-        results
-            .pop()
-            .ok_or_else(|| GeneBearError::Other("Empty response from GeneBe API".into()))
-    }
-
-    /// Annotate a **batch** of variants (up to 1 000).
-    ///
-    /// Results are returned in the same order as `variants`.
-    pub async fn annotate_variants(
+    /// The records of the API are deserialized into `T`, which is either
+    /// [`AnnotatedVariant`](crate::AnnotatedVariant) with all fields or a struct with just
+    /// the fields you need.
+    pub async fn annotate<T: DeserializeOwned>(
         &self,
         variants: &[Variant],
         genome: Genome,
         opts: AnnotateOptions,
-    ) -> Result<Vec<AnnotatedVariant>, GeneBearError> {
-        if variants.len() > MAX_BATCH {
-            return Err(GeneBearError::BatchTooLarge {
-                requested: variants.len(),
-            });
-        }
-        if variants.is_empty() {
-            return Ok(vec![]);
-        }
-
-        let keys: Vec<String> = variants.iter().map(|v| v.cache_key(genome)).collect();
-
-        let mut results: Vec<Option<AnnotatedVariant>> = vec![None; variants.len()];
-        let mut miss_indices: Vec<usize> = Vec::new();
+    ) -> Result<Vec<T>, GeneBearError> {
+        let keys: Vec<String> = variants.iter().map(|v| v.cache_key(genome, opts)).collect();
+        let mut annotations: Vec<Option<T>> = variants.iter().map(|_| None).collect();
 
         if let Some(cache) = &self.cache {
-            let key_refs: Vec<&str> = keys.iter().map(String::as_str).collect();
-            let cached = cache.get_batch(&key_refs)?;
-
-            for (i, key) in keys.iter().enumerate() {
-                if let Some(ann) = cached.get(key) {
-                    debug!(key, "cache hit");
-                    results[i] = Some(ann.clone());
-                } else {
-                    miss_indices.push(i);
+            for (annotations, keys) in annotations
+                .chunks_mut(MAX_BATCH)
+                .zip(keys.chunks(MAX_BATCH))
+            {
+                let key_refs: Vec<&str> = keys.iter().map(String::as_str).collect();
+                let cached = cache.get_batch(&key_refs)?;
+                for (annotation, key) in annotations.iter_mut().zip(keys) {
+                    if let Some(record) = cached.get(key) {
+                        *annotation = Some(serde_json::from_value(Value::Object(record.clone()))?);
+                    }
                 }
             }
-        } else {
-            miss_indices = (0..variants.len()).collect();
         }
 
-        if miss_indices.is_empty() {
-            info!(count = variants.len(), "all variants served from cache");
-            return Ok(results.into_iter().flatten().collect());
-        }
-
-        let miss_variants: Vec<&Variant> = miss_indices.iter().map(|&i| &variants[i]).collect();
-
-        let body: Vec<serde_json::Value> = miss_variants
-            .iter()
-            .map(|v| {
-                serde_json::json!({
-                    "chr": v.chr,
-                    "pos": v.pos,
-                    "ref": v.ref_allele,
-                    "alt": v.alt_allele,
-                })
-            })
+        let misses: Vec<usize> = (0..variants.len())
+            .filter(|&i| annotations[i].is_none())
             .collect();
+        debug!(
+            cached = variants.len() - misses.len(),
+            asked = misses.len(),
+            "looked up variants"
+        );
+        for batch in misses.chunks(MAX_BATCH) {
+            let selected: Vec<&Variant> = batch.iter().map(|&i| &variants[i]).collect();
+            let records = self.fetch(&selected, genome, opts).await?;
+            if let Some(cache) = &self.cache {
+                let entries: Vec<(&str, &Record)> = batch
+                    .iter()
+                    .map(|&i| keys[i].as_str())
+                    .zip(&records)
+                    .collect();
+                if let Err(e) = cache.store_batch(&entries) {
+                    warn!("Failed to write batch to cache: {e}");
+                }
+            }
+            for (&i, record) in batch.iter().zip(records) {
+                annotations[i] = Some(serde_json::from_value(Value::Object(record))?);
+            }
+        }
+        Ok(annotations.into_iter().flatten().collect())
+    }
 
-        let mut query: Vec<(&str, &str)> = vec![("genome", genome.as_str())];
-        if opts.use_refseq == Some(true) {
-            query.push(("useRefseq", "true"));
-        }
-        if opts.use_ensembl == Some(true) {
-            query.push(("useEnsembl", "true"));
-        }
-        if opts.omit_acmg {
-            query.push(("omitAcmg", "true"));
-        }
-        if opts.omit_csq {
-            query.push(("omitCsq", "true"));
-        }
-        if opts.omit_basic {
-            query.push(("omitBasic", "true"));
-        }
-        if opts.omit_advanced {
-            query.push(("omitAdvanced", "true"));
-        }
-        if opts.all_genes {
-            query.push(("allGenes", "true"));
-        }
+    /// Ask the API for at most [`MAX_BATCH`] variants.
+    async fn fetch(
+        &self,
+        variants: &[&Variant],
+        genome: Genome,
+        opts: AnnotateOptions,
+    ) -> Result<Vec<Record>, GeneBearError> {
+        let mut query = vec![("genome", genome.as_str())];
+        query.extend(opts.params());
 
         self.rate_limiter.acquire().await;
 
-        let url = format!("{}/variants", self.base_url);
-        let mut req = self.http.post(&url);
-
+        let mut req = self.http.post(format!("{}/variants", self.base_url));
         if let (Some(email), Some(key)) = (&self.email, &self.api_key) {
             req = req.basic_auth(email, Some(key));
         }
+        let resp = check(req.query(&query).json(variants).send().await?).await?;
 
-        let resp = req.query(&query).json(&body).send().await?;
-
-        let status = resp.status();
-        if !status.is_success() {
-            let msg = resp.text().await.unwrap_or_default();
-            return Err(if status.is_client_error() {
-                GeneBearError::ApiClientError {
-                    status: status.as_u16(),
-                    message: msg,
-                }
-            } else {
-                GeneBearError::ApiServerError {
-                    status: status.as_u16(),
-                    message: msg,
-                }
-            });
-        }
-
-        let api_response: ApiResponse = resp.json().await?;
-        let fetched = api_response.variants;
-        if fetched.len() != miss_indices.len() {
+        let fetched = resp.json::<ApiResponse>().await?.variants;
+        if fetched.len() != variants.len() {
             return Err(GeneBearError::Other(format!(
                 "GeneBe returned {} annotations for {} variants",
                 fetched.len(),
-                miss_indices.len()
+                variants.len()
             )));
         }
-
-        for (&original_idx, ann) in miss_indices.iter().zip(fetched) {
-            results[original_idx] = Some(ann);
-        }
-
-        if let Some(cache) = &self.cache {
-            let mut pairs: Vec<(String, AnnotatedVariant)> = Vec::new();
-            for &original_idx in &miss_indices {
-                if let Some(Some(ann)) = results.get(original_idx) {
-                    pairs.push((keys[original_idx].clone(), ann.clone()));
-                }
-            }
-            let ref_pairs: Vec<(&str, &AnnotatedVariant)> =
-                pairs.iter().map(|(k, v)| (k.as_str(), v)).collect();
-            if let Err(e) = cache.store_batch(&ref_pairs) {
-                warn!("Failed to write batch to cache: {e}");
-            }
-        }
-
-        Ok(results.into_iter().flatten().collect())
-    }
-
-    /// Annotate an arbitrarily large list of variants, automatically splitting
-    /// into batches of 1 000 and respecting the rate limiter between batches.
-    pub async fn annotate_variants_chunked(
-        &self,
-        variants: &[Variant],
-        genome: Genome,
-        opts: AnnotateOptions,
-    ) -> Result<Vec<AnnotatedVariant>, GeneBearError> {
-        let mut all = Vec::with_capacity(variants.len());
-        for chunk in variants.chunks(MAX_BATCH) {
-            let mut batch = self.annotate_variants(chunk, genome, opts.clone()).await?;
-            all.append(&mut batch);
-        }
-        Ok(all)
+        Ok(fetched)
     }
 
     /// Number of variants currently in the cache, or `None` if caching is disabled.
@@ -296,9 +206,172 @@ impl GeneBears {
     }
 }
 
+/// Turn error responses into [`GeneBearError::ApiClientError`] or
+/// [`GeneBearError::ApiServerError`].
+pub(crate) async fn check(response: Response) -> Result<Response, GeneBearError> {
+    let status = response.status();
+    if status.is_success() {
+        return Ok(response);
+    }
+    let message = response.text().await.unwrap_or_default();
+    Err(if status.is_client_error() {
+        GeneBearError::ApiClientError {
+            status: status.as_u16(),
+            message,
+        }
+    } else {
+        GeneBearError::ApiServerError {
+            status: status.as_u16(),
+            message,
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models::AnnotatedVariant;
+    use serde::Deserialize;
+    use serde_json::json;
+    use tempfile::TempDir;
+    use wiremock::matchers::any;
+    use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
+
+    /// Answers like the API with a record per requested variant.
+    struct Records;
+
+    impl Respond for Records {
+        fn respond(&self, request: &Request) -> ResponseTemplate {
+            let variants: Vec<Value> = serde_json::from_slice(&request.body).unwrap();
+            let records: Vec<Value> = variants
+                .into_iter()
+                .map(|v| json!({"chr": v["chr"], "pos": v["pos"], "ref": v["ref"], "alt": v["alt"], "revel_score": 0.5}))
+                .collect();
+            ResponseTemplate::new(200).set_body_json(json!({ "variants": records }))
+        }
+    }
+
+    /// Mock API that expects `requests` requests.
+    async fn api(requests: u64) -> MockServer {
+        let server = MockServer::start().await;
+        Mock::given(any())
+            .respond_with(Records)
+            .expect(requests)
+            .mount(&server)
+            .await;
+        server
+    }
+
+    fn client(server: &MockServer, cache: Option<PathBuf>) -> GeneBears {
+        GeneBears::new(ClientConfig {
+            base_url: Some(server.uri()),
+            cache_path: cache,
+            ..Default::default()
+        })
+        .unwrap()
+    }
+
+    #[derive(Debug, Deserialize, PartialEq)]
+    struct Revel {
+        pos: u64,
+        revel_score: Option<f64>,
+    }
+
+    #[tokio::test]
+    async fn annotate_deserializes_records_in_variant_order() {
+        let server = api(1).await;
+        let variants = [
+            Variant::new("22", 200, "A", "T"),
+            Variant::new("22", 100, "A", "T"),
+        ];
+
+        let annotations: Vec<Revel> = client(&server, None)
+            .annotate(&variants, Genome::Hg38, AnnotateOptions::default())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            annotations,
+            [
+                Revel {
+                    pos: 200,
+                    revel_score: Some(0.5)
+                },
+                Revel {
+                    pos: 100,
+                    revel_score: Some(0.5)
+                }
+            ]
+        );
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn annotate_asks_the_api_in_batches() {
+        let server = api(3).await;
+        let variants: Vec<Variant> = (1..=2500)
+            .map(|pos| Variant::new("22", pos, "A", "T"))
+            .collect();
+
+        let annotations: Vec<AnnotatedVariant> = client(&server, None)
+            .annotate(&variants, Genome::Hg38, AnnotateOptions::default())
+            .await
+            .unwrap();
+
+        let positions: Vec<u64> = annotations.iter().map(|a| a.pos.unwrap()).collect();
+        assert_eq!(positions, (1..=2500).collect::<Vec<_>>());
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn cached_variants_skip_the_api() {
+        let server = api(2).await;
+        let dir = TempDir::new().unwrap();
+        let client = client(&server, Some(dir.path().join("cache.duckdb")));
+        let variants = [
+            Variant::new("22", 100, "A", "T"),
+            Variant::new("22", 100, "A", "T"),
+        ];
+        let omit_acmg = AnnotateOptions {
+            omit_acmg: true,
+            ..Default::default()
+        };
+
+        for opts in [
+            AnnotateOptions::default(),
+            AnnotateOptions::default(),
+            omit_acmg,
+        ] {
+            let annotations: Vec<Revel> = client
+                .annotate(&variants, Genome::Hg38, opts)
+                .await
+                .unwrap();
+            assert_eq!(annotations.len(), 2);
+        }
+
+        // Options change the records, so they are cached separately.
+        assert_eq!(client.cache_count().unwrap().unwrap(), 2);
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn missing_annotations_are_an_error() {
+        let server = MockServer::start().await;
+        Mock::given(any())
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "variants": [{}] })))
+            .mount(&server)
+            .await;
+        let variants = [
+            Variant::new("22", 100, "A", "T"),
+            Variant::new("22", 200, "C", "G"),
+        ];
+
+        let result: Result<Vec<AnnotatedVariant>, _> = client(&server, None)
+            .annotate(&variants, Genome::Hg38, AnnotateOptions::default())
+            .await;
+
+        assert!(result.is_err());
+    }
 
     #[tokio::test]
     async fn test_client() {
@@ -308,8 +381,8 @@ mod tests {
             Variant::new("6", 160_585_140, "T", "G"),
         ];
 
-        let results = client
-            .annotate_variants(&variants, Genome::Hg38, AnnotateOptions::default())
+        let results: Vec<AnnotatedVariant> = client
+            .annotate(&variants, Genome::Hg38, AnnotateOptions::default())
             .await
             .unwrap();
         assert_eq!(results.len(), 2);
@@ -320,81 +393,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cache_hit_skips_http() {
-        use tempfile::tempdir;
-        use wiremock::matchers::any;
-        use wiremock::{Mock, MockServer};
-
-        let server = MockServer::start().await;
-        Mock::given(any())
-            .respond_with(wiremock::ResponseTemplate::new(200))
-            .expect(0)
-            .mount(&server)
-            .await;
-
-        let dir = tempdir().unwrap();
-        let db_path = dir.path().join("cache.duckdb");
-        let variant = Variant::new("22", 12345, "A", "T");
-        let cache = Cache::open(&db_path).unwrap();
-        let key = variant.cache_key(Genome::Hg38);
-
-        let ann = AnnotatedVariant::default();
-
-        cache.store(&key, &ann).unwrap();
-
-        let config = ClientConfig {
-            cache_path: Some(db_path.clone()),
-            base_url: Some(server.uri()),
-            ..Default::default()
-        };
-
-        let client = GeneBears::new(config).unwrap();
-        let _res = client
-            .annotate_variant(&variant, Genome::Hg38, AnnotateOptions::default())
-            .await
-            .unwrap();
-        server.verify().await;
-    }
-
-    #[tokio::test]
-    async fn missing_annotations_are_an_error() {
-        use wiremock::matchers::any;
-        use wiremock::{Mock, MockServer};
-
-        let server = MockServer::start().await;
-        Mock::given(any())
-            .respond_with(
-                wiremock::ResponseTemplate::new(200)
-                    .set_body_json(serde_json::json!({ "variants": [{}] })),
-            )
-            .mount(&server)
-            .await;
-
-        let config = ClientConfig {
-            base_url: Some(server.uri()),
-            ..Default::default()
-        };
-        let client = GeneBears::new(config).unwrap();
-        let variants = vec![
-            Variant::new("22", 100, "A", "T"),
-            Variant::new("22", 200, "C", "G"),
-        ];
-
-        let result = client
-            .annotate_variants(&variants, Genome::Hg38, AnnotateOptions::default())
-            .await;
-        assert!(result.is_err());
-    }
-
-    #[tokio::test]
     async fn reference_mismatch_is_reported_as_warning() {
         let client = GeneBears::new(ClientConfig::default()).unwrap();
         let variant = Variant::new("7", 140_753_336, "G", "T");
 
-        let result = client
-            .annotate_variant(&variant, Genome::Hg38, AnnotateOptions::default())
+        let results: Vec<AnnotatedVariant> = client
+            .annotate(&[variant], Genome::Hg38, AnnotateOptions::default())
             .await
             .unwrap();
-        assert!(result.warning.is_some());
+        assert!(results[0].warning.is_some());
     }
 }
