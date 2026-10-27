@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::time::Duration;
 
 use reqwest::header::{self, HeaderMap, HeaderValue};
 use reqwest::{Client, Response};
@@ -86,7 +87,12 @@ impl GeneBears {
         let mut default_headers = HeaderMap::new();
         default_headers.insert(header::ACCEPT, HeaderValue::from_static("application/json"));
 
-        let http = Client::builder().default_headers(default_headers).build()?;
+        let http = Client::builder()
+            .default_headers(default_headers)
+            .connect_timeout(Duration::from_secs(30))
+            // A stalled request would otherwise never end.
+            .read_timeout(Duration::from_secs(60))
+            .build()?;
 
         let cache = if let Some(ref path) = config.cache_path {
             info!("Using DuckDB cache at {:?}", path);
