@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.0.1](https://github.com/koesterlab/genebears/compare/v1.0.0...v1.0.1) (2026-10-27)
+
+
+### Bug Fixes
+
+* Time out stalled GeneBe API requests ([#15](https://github.com/koesterlab/genebears/issues/15)) ([8ec54ae](https://github.com/koesterlab/genebears/commit/8ec54ae39ce79cf0f8156015285b681cdb451078))
+
 ## [1.0.0](https://github.com/koesterlab/genebears/compare/v0.3.0...v1.0.0) (2026-10-13)
 
 
